@@ -260,14 +260,16 @@ def get_intent_emotion_llm() -> Runnable:
 
 def get_vision_llm() -> ChatOllama:
     """
-    비전(이미지 분석)용 LLM (Qwen3.5 35B-A3B, temp=0.2, format=json).
+    비전(이미지 분석)용 LLM (Qwen3.5 35B-A3B, temp=0.2).
 
     멀티모달 모델로 이미지 + 텍스트 입력을 받아 JSON 구조화 출력을 생성한다.
     영화 포스터/분위기 사진에서 장르/무드/시각요소를 추출하는 데 사용된다.
+
+    Note: format="json" 미사용. constrained decoding이 VLM 속도를 저하시키며,
+    _parse_json_response()의 3단계 폴백(코드 블록, 직접 JSON, 중괄호 추출)으로 충분.
     """
     logger.debug("get_vision_llm_called", model=settings.VISION_MODEL)
     return get_llm(
         model=settings.VISION_MODEL,
         temperature=0.2,
-        format="json",
     )

@@ -39,6 +39,7 @@ Redis 세션 저장소를 통해 멀티턴 대화 상태를 영속화한다.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -405,8 +406,83 @@ NODE_STATUS_MESSAGES: dict[str, str] = {
 
 
 # ============================================================
+# 다음 노드 예측 (SSE 상태 메시지 지연 방지)
+# ============================================================
+
+
+def _predict_next_node(completed_node: str, state: dict) -> tuple[str, str] | None:
+    """
+    완료된 노드 이후 실행될 다음 노드를 예측하여 (phase, message) 튜플을 반환한다.
+
+    노드 완료 시점에 다음 노드의 "진행 중" 상태 메시지를 즉시 발행하기 위해 사용한다.
+    기존 라우팅 함수(route_has_image, route_after_intent 등)를 호출하여
+    정확한 다음 노드를 결정한다.
+
+    이 함수가 없으면 context_loader(~60ms) 완료 후 intent_emotion_classifier(50~70초)가
+    실행되는 동안 "사용자 정보를 불러오고 있어요..." 메시지가 keepalive로 반복 표시된다.
+    이 함수를 통해 다음 노드 메시지("말씀을 이해하고 감정을 분석하고 있어요...")를
+    즉시 발행하여 사용자에게 정확한 진행 상태를 안내한다.
+
+    Args:
+        completed_node: 방금 완료된 노드 이름
+        state: 현재까지 누적된 state dict (라우팅 함수에 전달)
+
+    Returns:
+        (다음 노드 이름, 한국어 상태 메시지) 튜플. 예측 불가 시 None.
+    """
+    try:
+        # 조건부 분기가 있는 노드: 라우팅 함수를 호출하여 다음 노드 결정
+        if completed_node == "context_loader":
+            next_node = route_has_image(state)
+        elif completed_node == "image_analyzer":
+            # image_analyzer → intent_emotion_classifier (고정 엣지)
+            next_node = "intent_emotion_classifier"
+        elif completed_node == "intent_emotion_classifier":
+            next_node = route_after_intent(state)
+        elif completed_node == "preference_refiner":
+            next_node = route_after_preference(state)
+        elif completed_node == "query_builder":
+            # query_builder → rag_retriever (고정 엣지)
+            next_node = "rag_retriever"
+        elif completed_node == "rag_retriever":
+            next_node = route_after_retrieval(state)
+        elif completed_node == "recommendation_ranker":
+            # recommendation_ranker → explanation_generator (고정 엣지)
+            next_node = "explanation_generator"
+        elif completed_node == "explanation_generator":
+            # explanation_generator → response_formatter (고정 엣지)
+            next_node = "response_formatter"
+        elif completed_node in (
+            "general_responder",
+            "tool_executor_node",
+            "error_handler",
+            "question_generator",
+        ):
+            # 모두 response_formatter로 이동 (고정 엣지)
+            next_node = "response_formatter"
+        else:
+            return None
+
+        # 예측된 노드의 상태 메시지가 있으면 반환
+        next_message = NODE_STATUS_MESSAGES.get(next_node)
+        if next_message:
+            return (next_node, next_message)
+    except Exception:
+        # 예측 실패 시 무시 — 다음 노드 완료 시 자연스럽게 갱신됨
+        pass
+    return None
+
+
+# ============================================================
 # SSE 스트리밍 인터페이스
 # ============================================================
+
+# SSE keepalive 간격 (초). 이 시간마다 status 이벤트를 발행하여 연결 유지
+_KEEPALIVE_INTERVAL_SEC = 15
+
+# 그래프 완료를 알리는 센티넬 객체
+_SENTINEL = object()
+
 
 async def run_chat_agent(
     user_id: str,
@@ -417,15 +493,21 @@ async def run_chat_agent(
     """
     Chat Agent를 SSE 스트리밍 모드로 실행한다.
 
+    asyncio.Queue 기반으로 그래프 이벤트를 수집하고,
+    _KEEPALIVE_INTERVAL_SEC(15초)마다 keepalive status 이벤트를 발행하여
+    VLM 등 장시간 노드 실행 중에도 SSE 연결이 끊기지 않도록 한다.
+
     세션 영속화 흐름:
     1. session_id가 비어있으면 자동 생성
     2. Redis에서 기존 세션 로드 → 초기 State에 병합
-    3. LangGraph astream으로 그래프 실행
-    4. 실행 완료 후 세션 저장
+    3. asyncio.Task로 그래프 실행, Queue를 통해 이벤트 전달
+    4. Queue에서 이벤트를 꺼내 yield (15초 타임아웃 시 keepalive 발행)
+    5. 실행 완료 후 세션 저장
 
     SSE 이벤트 형식:
     - {"event": "session", "data": {"session_id": "uuid-..."}}  — 세션 ID 전달
     - {"event": "status", "data": {"phase": "노드명", "message": "한국어 상태"}}
+    - {"event": "status", "data": {"phase": "...", "message": "...", "keepalive": true}}
     - {"event": "movie_card", "data": {RankedMovie JSON}}
     - {"event": "token", "data": {"delta": "응답 텍스트"}}
     - {"event": "clarification", "data": {ClarificationResponse JSON}}
@@ -479,33 +561,89 @@ async def run_chat_agent(
     # 4. session 이벤트 발행 (클라이언트에 session_id 전달)
     yield _format_sse_event("session", {"session_id": session_id})
 
-    # 4-1. 이미지가 있으면 곧바로 "이미지 분석 중" status 발행 (VLM 호출이 1~2분 걸릴 수 있어 무한 로딩처럼 보이는 것 방지)
-    if image_data:
-        yield _format_sse_event("status", {
-            "phase": "image_analysis",
-            "message": "이미지를 분석하고 있어요... 🖼️ (1~2분 걸릴 수 있어요)",
-        })
+    # ── Queue 기반 그래프 실행 + keepalive ──
+    queue: asyncio.Queue = asyncio.Queue()
+    # 현재 처리 중인 노드 이름/메시지 (keepalive에서 사용)
+    current_phase = "context_loader"
+    current_message = NODE_STATUS_MESSAGES.get("context_loader", "처리 중...")
 
     # 최종 State를 추적하기 위한 누적 dict
     final_state: dict = {}
 
+    async def _run_graph_to_queue():
+        """
+        LangGraph astream을 실행하고, 각 노드 완료 이벤트를 Queue에 넣는다.
+
+        그래프 완료 시 _SENTINEL, 에러 시 Exception 객체를 Queue에 넣어
+        소비자 루프에 종료를 알린다.
+        """
+        try:
+            async for event in chat_graph.astream(
+                initial_state,
+                stream_mode="updates",
+            ):
+                await queue.put(event)
+            # 그래프 정상 완료 → 센티넬 삽입
+            await queue.put(_SENTINEL)
+        except Exception as e:
+            # 그래프 실행 에러 → Exception 객체 삽입
+            await queue.put(e)
+
+    # 그래프를 백그라운드 Task로 실행
+    graph_task = asyncio.create_task(_run_graph_to_queue())
+
     try:
-        # LangGraph astream: 각 노드 완료 시 업데이트 수신
-        async for event in chat_graph.astream(
-            initial_state,
-            stream_mode="updates",
-        ):
-            # event 형식: {"node_name": {updates_dict}}
-            for node_name, updates in event.items():
+        while True:
+            try:
+                # 15초 동안 Queue에서 이벤트를 기다림
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_KEEPALIVE_INTERVAL_SEC,
+                )
+            except asyncio.TimeoutError:
+                # 15초 동안 이벤트 없음 → keepalive status 발행 (연결 유지)
+                yield _format_sse_event("status", {
+                    "phase": current_phase,
+                    "message": current_message,
+                    "keepalive": True,
+                })
+                continue
+
+            # 센티넬: 그래프 정상 완료
+            if item is _SENTINEL:
+                break
+
+            # Exception 객체: 그래프 실행 에러
+            if isinstance(item, Exception):
+                raise item
+
+            # 정상 이벤트: {"node_name": {updates_dict}}
+            for node_name, updates in item.items():
                 # 최종 state 누적 (세션 저장용)
                 final_state.update(updates)
 
-                # status 이벤트 발행
-                status_msg = NODE_STATUS_MESSAGES.get(node_name, f"{node_name} 처리 중...")
+                # 완료된 노드의 상태 메시지 발행
+                completed_message = NODE_STATUS_MESSAGES.get(node_name, f"{node_name} 처리 중...")
                 yield _format_sse_event("status", {
                     "phase": node_name,
-                    "message": status_msg,
+                    "message": completed_message,
                 })
+
+                # 다음 노드의 "진행 중" 상태 메시지를 즉시 발행하여
+                # keepalive가 정확한 메시지를 표시하도록 한다.
+                # 예: context_loader 완료 → "말씀을 이해하고 감정을 분석하고 있어요..." 즉시 표시
+                merged = {**initial_state, **final_state}
+                predicted = _predict_next_node(node_name, merged)
+                if predicted:
+                    current_phase, current_message = predicted
+                    yield _format_sse_event("status", {
+                        "phase": current_phase,
+                        "message": current_message,
+                    })
+                else:
+                    # 예측 불가 시 완료된 노드의 메시지 유지
+                    current_phase = node_name
+                    current_message = completed_message
 
                 # question_generator 완료 시 clarification 이벤트 발행
                 if node_name == "question_generator":
@@ -541,6 +679,15 @@ async def run_chat_agent(
         logger.error("chat_agent_stream_error", error=str(e), error_type=type(e).__name__, elapsed_ms=round(graph_elapsed_ms, 1))
         yield _format_sse_event("error", {"message": str(e)})
         yield _format_sse_event("done", {})
+
+    finally:
+        # 그래프 Task가 아직 실행 중이면 정리 (에러 발생 시)
+        if not graph_task.done():
+            graph_task.cancel()
+            try:
+                await graph_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _format_sse_event(event_type: str, data: dict) -> dict:

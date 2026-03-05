@@ -3,8 +3,10 @@
 
 Phase 3: lifespan 추가 (5개 DB 클라이언트 초기화/종료), chat_router 등록.
 LangSmith: LANGCHAIN_API_KEY 설정 시 LLM 호출/그래프 실행 자동 트레이싱.
+Ollama Warmup: 앱 시작 시 두 모델(qwen3.5, exaone-32b)을 사전 로드하여 첫 요청 cold start 제거.
 """
 
+import asyncio
 import os
 import time
 import traceback
@@ -37,7 +39,80 @@ if settings.LANGCHAIN_API_KEY:
     )
 
 # 앱 버전
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
+
+
+async def _warmup_ollama_models() -> None:
+    """
+    Ollama 모델을 사전 로드하여 첫 API 요청의 cold start를 제거한다.
+
+    Ollama는 첫 호출 시 모델을 GPU에 로드하는 데 30~90초가 걸린다.
+    앱 시작 시 짧은 dummy 호출을 수행하면 사용자 첫 요청 전에
+    이미 GPU에 모델이 올라가 있어 즉시 추론 가능.
+
+    두 모델을 순차적으로 로드한다:
+    1. qwen3.5:35b-a3b (의도+감정 분류, 이미지 분석)
+    2. exaone-32b:latest (선호 추출, 대화, 추천 이유)
+
+    OLLAMA_MAX_LOADED_MODELS=2 환경변수가 설정되어 있어야
+    두 모델이 동시에 GPU에 유지된다 (모델 스왑 방지).
+
+    warmup 실패 시에도 앱은 정상 기동한다 (에러 전파 금지).
+    """
+    from langchain_core.messages import HumanMessage
+
+    from monglepick.llm.factory import get_llm
+
+    # 사전 로드할 모델 목록 (중복 제거)
+    models_to_warmup: list[str] = []
+    seen: set[str] = set()
+    for model_name in [settings.INTENT_MODEL, settings.CONVERSATION_MODEL]:
+        if model_name not in seen:
+            models_to_warmup.append(model_name)
+            seen.add(model_name)
+
+    logger.info(
+        "ollama_warmup_start",
+        models=models_to_warmup,
+        max_loaded_models=settings.OLLAMA_MAX_LOADED_MODELS,
+    )
+
+    for model_name in models_to_warmup:
+        warmup_start = time.perf_counter()
+        try:
+            # 짧은 dummy 호출로 모델을 GPU에 로드한다.
+            # temperature=0.1, num_predict=1로 최소 토큰만 생성하여 빠르게 완료.
+            llm = get_llm(model=model_name, temperature=0.1, num_predict=1)
+            await asyncio.wait_for(
+                llm.ainvoke([HumanMessage(content="ping")]),
+                timeout=120.0,  # 모델 로딩 포함 최대 2분 대기
+            )
+            elapsed_sec = time.perf_counter() - warmup_start
+            logger.info(
+                "ollama_model_warmed_up",
+                model=model_name,
+                elapsed_sec=round(elapsed_sec, 1),
+            )
+        except asyncio.TimeoutError:
+            elapsed_sec = time.perf_counter() - warmup_start
+            logger.warning(
+                "ollama_warmup_timeout",
+                model=model_name,
+                elapsed_sec=round(elapsed_sec, 1),
+                timeout_sec=120,
+            )
+        except Exception as e:
+            elapsed_sec = time.perf_counter() - warmup_start
+            # Ollama 서버 미실행 등 — warmup 실패해도 앱은 정상 기동
+            logger.warning(
+                "ollama_warmup_failed",
+                model=model_name,
+                error=str(e),
+                error_type=type(e).__name__,
+                elapsed_sec=round(elapsed_sec, 1),
+            )
+
+    logger.info("ollama_warmup_complete", models=models_to_warmup)
 
 
 @asynccontextmanager
@@ -51,17 +126,38 @@ async def lifespan(app: FastAPI):
     # ── Startup ──
     startup_start = time.perf_counter()
     logger.info("app_startup", version=APP_VERSION)
+
+    # ── [1] OLLAMA_MAX_LOADED_MODELS 환경변수 설정 ──
+    # Ollama 서버가 동시에 GPU에 유지할 모델 수를 설정한다.
+    # Mac 64GB 통합 메모리에서 qwen3.5(~20GB) + exaone-32b(~20GB) 동시 로드 가능.
+    # 이 환경변수가 없으면 Ollama는 기본적으로 1개 모델만 유지하여
+    # 매 요청마다 모델 스왑(30~90초)이 발생한다.
+    os.environ["OLLAMA_MAX_LOADED_MODELS"] = str(settings.OLLAMA_MAX_LOADED_MODELS)
+    logger.info(
+        "ollama_max_loaded_models_set",
+        value=settings.OLLAMA_MAX_LOADED_MODELS,
+    )
+
+    # ── [2] 5개 DB 클라이언트 초기화 ──
     try:
         await init_all_clients()
-        startup_elapsed_ms = (time.perf_counter() - startup_start) * 1000
-        logger.info("app_startup_complete", version=APP_VERSION, elapsed_ms=round(startup_elapsed_ms, 1))
+        db_elapsed_ms = (time.perf_counter() - startup_start) * 1000
+        logger.info("db_clients_initialized", elapsed_ms=round(db_elapsed_ms, 1))
     except Exception as e:
         # DB 연결 실패 시에도 앱은 기동 (health 엔드포인트는 동작)
-        startup_elapsed_ms = (time.perf_counter() - startup_start) * 1000
+        db_elapsed_ms = (time.perf_counter() - startup_start) * 1000
         logger.error(
             "app_startup_db_error", error=str(e), error_type=type(e).__name__,
-            stack_trace=traceback.format_exc(), elapsed_ms=round(startup_elapsed_ms, 1),
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
         )
+
+    # ── [3] Ollama 모델 사전 로드 (warmup) ──
+    # 앱 시작 시 두 모델에 dummy 호출을 수행하여 GPU에 미리 로드한다.
+    # 이를 통해 사용자 첫 요청에서 cold start(30~90초)를 제거한다.
+    await _warmup_ollama_models()
+
+    startup_elapsed_ms = (time.perf_counter() - startup_start) * 1000
+    logger.info("app_startup_complete", version=APP_VERSION, elapsed_ms=round(startup_elapsed_ms, 1))
 
     yield
 
@@ -116,12 +212,21 @@ app = FastAPI(
     },
 )
 
+# ── CORS 설정 ──
+# settings.CORS_ALLOWED_ORIGINS가 "*"이면 전체 허용 (개발 환경),
+# 그 외에는 쉼표 구분 오리진 목록만 허용 (프로덕션 환경).
+_cors_origins_raw = settings.CORS_ALLOWED_ORIGINS.strip()
+if _cors_origins_raw == "*":
+    _cors_origins = ["*"]
+else:
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # API 라우터 등록

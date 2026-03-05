@@ -6,17 +6,31 @@ Chat Agent SSE/동기 엔드포인트 (§6 Phase 3).
 - POST /api/v1/chat/sync  — 동기 JSON (디버그/테스트용)
 - POST /api/v1/chat/upload — 멀티파트 이미지 업로드 (파일+메시지)
 
+보안 강화:
+- Data URL 접두사 제거 + base64 패딩 보정 (_strip_base64_prefix)
+- 매직바이트 기반 이미지 검증 (_validate_image_bytes)
+- IP당 분당 업로드 횟수 제한 (_check_upload_rate_limit)
+- VLM 동시 처리 Semaphore (_vlm_semaphore)
+- Pillow DecompressionBomb 방어 (IMAGE_MAX_PIXELS)
+
 요청 모델: ChatRequest (user_id, session_id, message, image)
 응답 모델: ChatSyncResponse (동기 전용)
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import binascii
+import io
+import re
 import time
+from collections import defaultdict
 
 import structlog
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi.responses import JSONResponse
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -24,6 +38,219 @@ from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
 from monglepick.config import settings
 
 logger = structlog.get_logger()
+
+
+# ============================================================
+# 보안 상수 + 모듈 레벨 상태
+# ============================================================
+
+# 허용 이미지 MIME 타입 → 매직바이트 매핑
+_IMAGE_MAGIC_BYTES: dict[str, bytes] = {
+    "image/jpeg": b"\xff\xd8\xff",
+    "image/png": b"\x89PNG",
+}
+
+# settings에서 허용 MIME 타입 세트 구성
+_ALLOWED_MIMES: set[str] = set(settings.ALLOWED_IMAGE_MIMES.split(","))
+
+# VLM 동시 처리 세마포어 — GPU 메모리 보호
+_vlm_semaphore = asyncio.Semaphore(settings.VLM_CONCURRENCY_LIMIT)
+
+# IP당 업로드 타임스탬프 기록 (인메모리, Rate Limiting용)
+_upload_timestamps: defaultdict[str, list[float]] = defaultdict(list)
+
+# Data URL 접두사 패턴: "data:image/jpeg;base64," 또는 "data:image/png;base64," 등
+_DATA_URL_RE = re.compile(r"^data:[^;]+;base64,", re.IGNORECASE)
+
+
+# ============================================================
+# 보안 헬퍼 함수
+# ============================================================
+
+def _strip_base64_prefix(data: str) -> str:
+    """
+    Data URL 접두사를 제거하고 base64 패딩을 보정한다.
+
+    프론트엔드에서 `data:image/png;base64,...` 형태의 Data URL을 보내면
+    base64.b64decode()가 접두사 때문에 `binascii.Error: Incorrect padding`을
+    발생시킨다. 이 함수는:
+    1. Data URL 접두사(`data:image/...;base64,`) 제거
+    2. base64 패딩 보정 (4의 배수가 되도록 `=` 추가)
+
+    Args:
+        data: base64 인코딩된 문자열 (Data URL 접두사 포함 가능)
+
+    Returns:
+        접두사가 제거되고 패딩이 보정된 순수 base64 문자열
+    """
+    # 1. Data URL 접두사 제거 ("data:image/jpeg;base64," → "")
+    stripped = _DATA_URL_RE.sub("", data)
+
+    # 2. base64 패딩 보정 — 길이가 4의 배수가 아니면 `=`로 채움
+    remainder = len(stripped) % 4
+    if remainder:
+        stripped += "=" * (4 - remainder)
+
+    return stripped
+
+
+def _validate_image_bytes(image_bytes: bytes) -> None:
+    """
+    이미지 바이트의 매직바이트를 검증하여 허용된 이미지 형식인지 확인한다.
+
+    JPEG(FF D8 FF)와 PNG(89 50 4E 47)만 허용한다.
+    GIF, SVG, 실행 파일 등 다른 형식은 거부한다.
+
+    Args:
+        image_bytes: 디코딩된 원본 이미지 바이트
+
+    Raises:
+        ValueError: 빈 데이터일 때 (status_code=400)
+        ValueError: 매직바이트가 허용 목록에 없을 때 (status_code=415)
+    """
+    if not image_bytes:
+        raise ValueError("400:이미지 데이터가 비어있습니다.")
+
+    # 매직바이트로 실제 파일 형식 확인
+    for mime, magic in _IMAGE_MAGIC_BYTES.items():
+        if mime in _ALLOWED_MIMES and image_bytes[:len(magic)] == magic:
+            return  # 허용된 형식
+
+    raise ValueError("415:허용되지 않는 이미지 형식입니다. JPEG 또는 PNG만 지원합니다.")
+
+
+def _check_upload_rate_limit(client_ip: str) -> None:
+    """
+    IP당 분당 이미지 업로드 횟수를 제한한다.
+
+    인메모리 타임스탬프 리스트로 슬라이딩 윈도우 방식 Rate Limiting을 구현한다.
+    60초 이전의 타임스탬프는 자동 만료된다.
+
+    Args:
+        client_ip: 클라이언트 IP 주소
+
+    Raises:
+        ValueError: 분당 업로드 한도 초과 시 (status_code=429)
+    """
+    now = time.time()
+    window_sec = 60.0
+
+    # 만료된 타임스탬프 제거 (60초 이전)
+    timestamps = _upload_timestamps[client_ip]
+    _upload_timestamps[client_ip] = [ts for ts in timestamps if now - ts < window_sec]
+
+    # 한도 초과 확인
+    if len(_upload_timestamps[client_ip]) >= settings.IMAGE_UPLOAD_RATE_LIMIT:
+        raise ValueError("429:이미지 업로드 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")
+
+    # 현재 요청 타임스탬프 기록
+    _upload_timestamps[client_ip].append(now)
+
+
+def _handle_security_error(error: ValueError) -> JSONResponse:
+    """
+    보안 헬퍼의 ValueError를 HTTP 응답으로 변환한다.
+
+    에러 메시지 형식: "status_code:detail_message"
+
+    Args:
+        error: 보안 헬퍼에서 발생한 ValueError
+
+    Returns:
+        적절한 HTTP 상태 코드의 JSONResponse
+    """
+    msg = str(error)
+    if ":" in msg:
+        code_str, detail = msg.split(":", 1)
+        try:
+            status_code = int(code_str)
+        except ValueError:
+            status_code = 400
+            detail = msg
+    else:
+        status_code = 400
+        detail = msg
+
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
+# ============================================================
+# 이미지 리사이즈 헬퍼
+# ============================================================
+
+def _resize_image_bytes(
+    image_bytes: bytes,
+    max_dim: int | None = None,
+) -> bytes:
+    """
+    이미지 바이트를 max_dim 이하로 리사이즈한다.
+
+    긴 변이 max_dim을 초과하면 비율을 유지하여 축소하고,
+    EXIF 회전 보정 후 JPEG quality=85로 압축한다.
+    이미 작은 이미지는 원본 바이트를 그대로 반환한다.
+
+    DecompressionBomb 방어: Image.open() 전에 MAX_IMAGE_PIXELS를 설정하여
+    과도하게 큰 이미지(예: 100,000×100,000px)에 의한 메모리 폭발을 방지한다.
+
+    Args:
+        image_bytes: 원본 이미지 바이트 (JPEG/PNG 등)
+        max_dim: 최대 변 길이 (px). None이면 settings.IMAGE_MAX_DIMENSION 사용
+
+    Returns:
+        리사이즈된 JPEG 이미지 바이트
+    """
+    max_dim = max_dim or settings.IMAGE_MAX_DIMENSION
+    original_size = len(image_bytes)
+
+    try:
+        # DecompressionBomb 방어: 허용 최대 픽셀 수 설정
+        Image.MAX_IMAGE_PIXELS = settings.IMAGE_MAX_PIXELS
+
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # EXIF 회전 보정 (사진이 90/180/270도 회전된 경우 정상 방향으로 복원)
+        img = ImageOps.exif_transpose(img)
+
+        # 긴 변이 max_dim 이하이면 리사이즈 불필요
+        if max(img.size) <= max_dim:
+            logger.debug(
+                "image_resize_skipped",
+                width=img.size[0],
+                height=img.size[1],
+                size_kb=original_size // 1024,
+                reason="already_small_enough",
+            )
+            return image_bytes
+
+        # 비율 유지하여 축소 (LANCZOS: 고품질 다운샘플링)
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+
+        # RGB 변환 (PNG 투명도 등 처리) + JPEG 압축
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        resized_bytes = buf.getvalue()
+
+        logger.info(
+            "image_resized",
+            original_size_kb=original_size // 1024,
+            resized_size_kb=len(resized_bytes) // 1024,
+            width=img.size[0],
+            height=img.size[1],
+            max_dim=max_dim,
+        )
+        return resized_bytes
+
+    except Exception as e:
+        # 리사이즈 실패 시 원본 반환 (에러 전파 금지)
+        logger.warning(
+            "image_resize_failed",
+            error=str(e),
+            original_size_kb=original_size // 1024,
+        )
+        return image_bytes
 
 # APIRouter 생성 (prefix는 main.py에서 설정)
 chat_router = APIRouter(tags=["chat"])
@@ -100,7 +327,7 @@ class ChatSyncResponse(BaseModel):
             "examples": [
                 {
                     "session_id": "abc123-...",
-                    "response": "우울할 때 보면 좋은 영화를 추천해드릴게요! 🎬\n\n1. **인사이드 아웃** ...",
+                    "response": "우울할 때 보면 좋은 영화를 추천해드릴게요!\n\n1. **인사이드 아웃** ...",
                     "intent": "recommend",
                     "emotion": "sad",
                     "movie_count": 5,
@@ -142,9 +369,12 @@ class ChatSyncResponse(BaseModel):
                 }
             },
         },
+        400: {"description": "base64 디코드 실패 또는 빈 이미지 데이터"},
+        415: {"description": "허용되지 않는 이미지 형식 (JPEG/PNG만 지원)"},
+        429: {"description": "이미지 업로드 Rate Limit 초과"},
     },
 )
-async def chat_sse(request: ChatRequest):
+async def chat_sse(request: ChatRequest, raw_request: Request):
     """
     SSE 스트리밍 채팅 엔드포인트.
 
@@ -159,7 +389,8 @@ async def chat_sse(request: ChatRequest):
     - error: 에러 메시지
 
     Args:
-        request: ChatRequest (user_id, session_id, message)
+        request: ChatRequest (user_id, session_id, message, image)
+        raw_request: FastAPI Request (클라이언트 IP 추출용)
 
     Returns:
         EventSourceResponse (SSE 스트리밍)
@@ -167,23 +398,67 @@ async def chat_sse(request: ChatRequest):
     # 요청 수신 타이밍 측정 시작
     request_start = time.perf_counter()
 
+    # base64 이미지가 있으면 보안 검증 → 디코드 → 리사이즈 → 재인코딩
+    image_data = request.image
+    if image_data:
+        # Rate Limiting — IP당 분당 업로드 횟수 제한
+        client_ip = raw_request.client.host if raw_request.client else "unknown"
+        try:
+            _check_upload_rate_limit(client_ip)
+        except ValueError as e:
+            return _handle_security_error(e)
+
+        # Data URL 접두사 제거 + base64 패딩 보정
+        stripped = _strip_base64_prefix(image_data)
+
+        # base64 디코드
+        try:
+            raw_bytes = base64.b64decode(stripped)
+        except (binascii.Error, ValueError) as e:
+            logger.warning("chat_sse_base64_error", error=str(e))
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "base64 이미지 디코딩에 실패했습니다."},
+            )
+
+        # 매직바이트 검증 — JPEG/PNG만 허용
+        try:
+            _validate_image_bytes(raw_bytes)
+        except ValueError as e:
+            return _handle_security_error(e)
+
+        # 리사이즈 + 재인코딩
+        resized_bytes = _resize_image_bytes(raw_bytes)
+        image_data = base64.b64encode(resized_bytes).decode("utf-8")
+
     logger.info(
         "chat_sse_request",
         user_id=request.user_id or "(anonymous)",
         session_id=request.session_id,
         message_preview=request.message[:50],
-        has_image=request.image is not None,
+        has_image=image_data is not None,
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — run_chat_agent()의 이벤트를 relay한다."""
-        async for sse_event in run_chat_agent(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            message=request.message,
-            image_data=request.image,
-        ):
-            yield sse_event
+        """SSE 이벤트 생성기 — VLM 세마포어로 동시 처리 제한 후 relay."""
+        # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
+        if image_data:
+            async with _vlm_semaphore:
+                async for sse_event in run_chat_agent(
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    message=request.message,
+                    image_data=image_data,
+                ):
+                    yield sse_event
+        else:
+            async for sse_event in run_chat_agent(
+                user_id=request.user_id,
+                session_id=request.session_id,
+                message=request.message,
+                image_data=image_data,
+            ):
+                yield sse_event
         # SSE 스트리밍 완료 시 타이밍 로깅
         elapsed_ms = (time.perf_counter() - request_start) * 1000
         logger.info(
@@ -211,6 +486,8 @@ async def chat_sse(request: ChatRequest):
         200: {
             "description": "채팅 응답 JSON. 추천 영화 수, 감정/의도 분류 결과 포함.",
         },
+        400: {"description": "base64 디코드 실패 또는 빈 이미지 데이터"},
+        415: {"description": "허용되지 않는 이미지 형식 (JPEG/PNG만 지원)"},
     },
 )
 async def chat_sync(request: ChatRequest):
@@ -228,20 +505,55 @@ async def chat_sync(request: ChatRequest):
     # 요청 수신 타이밍 측정 시작
     request_start = time.perf_counter()
 
+    # base64 이미지가 있으면 보안 검증
+    image_for_agent = request.image
+    if image_for_agent:
+        # Data URL 접두사 제거 + base64 패딩 보정
+        stripped = _strip_base64_prefix(image_for_agent)
+
+        # base64 디코드 검증
+        try:
+            raw_bytes = base64.b64decode(stripped)
+        except (binascii.Error, ValueError) as e:
+            logger.warning("chat_sync_base64_error", error=str(e))
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "base64 이미지 디코딩에 실패했습니다."},
+            )
+
+        # 매직바이트 검증 — JPEG/PNG만 허용
+        try:
+            _validate_image_bytes(raw_bytes)
+        except ValueError as e:
+            return _handle_security_error(e)
+
+        # 검증 통과 시 정제된 base64 사용
+        image_for_agent = stripped
+
     logger.info(
         "chat_sync_request",
         user_id=request.user_id or "(anonymous)",
         session_id=request.session_id,
         message_preview=request.message[:50],
-        has_image=request.image is not None,
+        has_image=image_for_agent is not None,
     )
 
-    state = await run_chat_agent_sync(
-        user_id=request.user_id,
-        session_id=request.session_id,
-        message=request.message,
-        image_data=request.image,
-    )
+    # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
+    if image_for_agent:
+        async with _vlm_semaphore:
+            state = await run_chat_agent_sync(
+                user_id=request.user_id,
+                session_id=request.session_id,
+                message=request.message,
+                image_data=image_for_agent,
+            )
+    else:
+        state = await run_chat_agent_sync(
+            user_id=request.user_id,
+            session_id=request.session_id,
+            message=request.message,
+            image_data=image_for_agent,
+        )
 
     # State에서 응답 정보 추출
     # session_id는 graph.py에서 자동 생성되어 state에 포함됨
@@ -310,9 +622,12 @@ async def chat_sync(request: ChatRequest):
                 }
             },
         },
+        415: {"description": "허용되지 않는 이미지 형식 (JPEG/PNG만 지원)"},
+        429: {"description": "이미지 업로드 Rate Limit 초과"},
     },
 )
 async def chat_upload(
+    raw_request: Request,
     message: str = Form(..., min_length=1, max_length=2000, description="사용자 입력 메시지"),
     user_id: str = Form(default="", description="사용자 ID"),
     session_id: str = Form(default="", description="세션 ID"),
@@ -324,7 +639,14 @@ async def chat_upload(
     이미지 파일을 직접 업로드할 수 있다 (base64 변환 불필요).
     Content-Type: multipart/form-data
 
+    보안 검증:
+    - MIME 타입 확인 (Content-Type 헤더)
+    - 매직바이트 검증 (파일 내용 실제 검사)
+    - 파일 크기 제한 (IMAGE_MAX_SIZE_MB)
+    - IP당 분당 업로드 횟수 제한
+
     Args:
+        raw_request: FastAPI Request (클라이언트 IP 추출용)
         message: 사용자 입력 메시지 (필수)
         user_id: 사용자 ID (빈 문자열이면 익명)
         session_id: 세션 ID (빈 문자열이면 신규 세션)
@@ -333,19 +655,46 @@ async def chat_upload(
     Returns:
         EventSourceResponse (SSE 스트리밍)
     """
-    # 이미지 파일 → base64 변환
+    # 이미지 파일 → 보안 검증 → 리사이즈 → base64 변환
     image_data: str | None = None
     if image is not None:
+        # Rate Limiting — IP당 분당 업로드 횟수 제한
+        client_ip = raw_request.client.host if raw_request.client else "unknown"
+        try:
+            _check_upload_rate_limit(client_ip)
+        except ValueError as e:
+            return _handle_security_error(e)
+
+        # MIME 타입 검증 (Content-Type 헤더 기반, 1차 방어)
+        if image.content_type and image.content_type not in _ALLOWED_MIMES:
+            logger.warning(
+                "chat_upload_mime_rejected",
+                content_type=image.content_type,
+                allowed=list(_ALLOWED_MIMES),
+            )
+            return JSONResponse(
+                status_code=415,
+                content={"detail": f"허용되지 않는 파일 형식입니다: {image.content_type}. JPEG 또는 PNG만 지원합니다."},
+            )
+
         # 파일 크기 검증
         contents = await image.read()
         max_bytes = settings.IMAGE_MAX_SIZE_MB * 1024 * 1024
         if len(contents) > max_bytes:
-            from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=413,
                 content={"detail": f"이미지 크기가 {settings.IMAGE_MAX_SIZE_MB}MB를 초과합니다."},
             )
-        image_data = base64.b64encode(contents).decode("utf-8")
+
+        # 매직바이트 검증 (파일 내용 실제 검사, 2차 방어 — MIME 스푸핑 방지)
+        try:
+            _validate_image_bytes(contents)
+        except ValueError as e:
+            return _handle_security_error(e)
+
+        # 리사이즈 후 base64 인코딩 (원본 10MB → ~200KB로 축소)
+        resized = _resize_image_bytes(contents)
+        image_data = base64.b64encode(resized).decode("utf-8")
 
     # 요청 수신 타이밍 측정 시작
     upload_start = time.perf_counter()
@@ -360,14 +709,25 @@ async def chat_upload(
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — run_chat_agent()의 이벤트를 relay한다."""
-        async for sse_event in run_chat_agent(
-            user_id=user_id,
-            session_id=session_id,
-            message=message,
-            image_data=image_data,
-        ):
-            yield sse_event
+        """SSE 이벤트 생성기 — VLM 세마포어로 동시 처리 제한 후 relay."""
+        # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
+        if image_data:
+            async with _vlm_semaphore:
+                async for sse_event in run_chat_agent(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message=message,
+                    image_data=image_data,
+                ):
+                    yield sse_event
+        else:
+            async for sse_event in run_chat_agent(
+                user_id=user_id,
+                session_id=session_id,
+                message=message,
+                image_data=image_data,
+            ):
+                yield sse_event
         # 업로드 요청 완료 타이밍 로깅
         elapsed_ms = (time.perf_counter() - upload_start) * 1000
         logger.info(

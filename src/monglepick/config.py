@@ -31,6 +31,10 @@ class Settings(BaseSettings):
 
     # ── Ollama (로컬 LLM 서버) ──
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # 동시에 GPU에 로드할 수 있는 최대 모델 수.
+    # Mac 64GB 통합 메모리에서 qwen3.5:35b-a3b + exaone-32b 2개 동시 로드 가능.
+    # 1이면 모델 스왑이 발생하여 매 요청 30~90초 추가 지연.
+    OLLAMA_MAX_LOADED_MODELS: int = 2
 
     # ── Qdrant ──
     QDRANT_URL: str = "http://localhost:6333"
@@ -77,7 +81,9 @@ class Settings(BaseSettings):
     # 이미지 업로드 최대 크기 (MB)
     IMAGE_MAX_SIZE_MB: int = 10
     # 이미지 분석(VLM) 호출 타임아웃(초). 초과 시 분석 생략 후 진행
-    VISION_TIMEOUT_SEC: int = 180
+    VISION_TIMEOUT_SEC: int = 90
+    # 이미지 리사이즈 최대 변 길이 (px). 긴 변이 이 값을 초과하면 비율 유지하여 축소
+    IMAGE_MAX_DIMENSION: int = 1024
 
     # ── Session / Conversation ──
     SESSION_TTL_DAYS: int = 30
@@ -96,6 +102,16 @@ class Settings(BaseSettings):
     # ── Security ──
     SERVICE_API_KEY: str = ""
     DAILY_TOKEN_LIMIT: int = 1_000_000
+    # CORS 허용 오리진 (쉼표 구분). "*"이면 전체 허용 (개발 환경)
+    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8000"
+    # 허용 이미지 MIME 타입 (쉼표 구분). 매직바이트 검증에도 사용
+    ALLOWED_IMAGE_MIMES: str = "image/jpeg,image/png"
+    # IP당 분당 최대 이미지 업로드 횟수. 초과 시 429 반환
+    IMAGE_UPLOAD_RATE_LIMIT: int = 10
+    # VLM 동시 처리 세마포어. GPU 메모리 보호용
+    VLM_CONCURRENCY_LIMIT: int = 2
+    # Pillow DecompressionBomb 방어: 최대 허용 픽셀 수 (25MP)
+    IMAGE_MAX_PIXELS: int = 25_000_000
 
 
 settings = Settings()

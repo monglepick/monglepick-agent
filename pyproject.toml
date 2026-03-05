@@ -37,6 +37,8 @@ dependencies = [
     # ── Embedding (Upstage Solar — OpenAI 호환 API 사용) ──
     # ── Ollama (로컬 LLM) ──
     "langchain-ollama>=0.3.0",
+    # ── Image Processing ──
+    "Pillow>=10.0.0",
     # ── Data Pipeline ──
     "httpx>=0.27.0",
     "pandas>=2.2.0",

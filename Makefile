@@ -1,8 +1,9 @@
 .PHONY: dev infra infra-down test lint clean
 
 # 개발 서버 실행
+# OLLAMA_MAX_LOADED_MODELS=2: qwen3.5 + exaone-32b 두 모델을 GPU에 동시 유지하여 모델 스왑 방지
 dev:
-	uv run uvicorn monglepick.main:app --reload --host 0.0.0.0 --port 8000
+	OLLAMA_MAX_LOADED_MODELS=2 uv run uvicorn monglepick.main:app --reload --host 0.0.0.0 --port 8000
 
 # Docker 인프라 실행
 infra:
