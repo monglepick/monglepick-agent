@@ -6,7 +6,6 @@
 #
 # 사전 준비:
 #   스테이징 맥북에 GitHub Actions self-hosted runner 설치 완료
-#   PROJECT_DIR 환경변수를 러너 환경에 설정 (또는 아래 기본값 수정)
 
 name: CI/CD
 
@@ -16,7 +15,7 @@ on:
   pull_request:
     branches: [develop, main]
 
-# 동시 배포 방지 (같은 브랜치에서 중복 배포 차단)
+# 동시 배포 방지
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -32,25 +31,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Python 3.12 설치
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # uv 패키지 매니저 설치
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
-      # 의존성 설치
+      # 의존성 설치 (lockfile 무시 — Ubuntu 플랫폼용 재해석)
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --no-frozen
 
-      # 린트 체크 (ruff)
       - name: Lint
         run: uv run --with ruff -- ruff check src/
 
-      # 테스트 실행 (308개 테스트, Ollama/DB 불필요)
       - name: Test
         run: |
           PYTHONPATH=src uv run --with pytest --with pytest-asyncio --with httpx \
@@ -62,22 +57,25 @@ jobs:
     needs: test
     runs-on: self-hosted
     timeout-minutes: 10
-    # develop 브랜치 push 시에만 배포
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
 
     steps:
+      # self-hosted 러너에서 최신 코드 checkout
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Deploy Agent container
         run: |
           set -e
           echo "========== AI Agent 배포 시작 =========="
 
           PROJECT_DIR="${PROJECT_DIR:-/Users/yoonhyungjoo/Documents/monglepick}"
-          cd "$PROJECT_DIR"
 
-          # 최신 코드 pull
-          cd monglepick-agent
-          git pull origin develop
-          cd ..
+          # checkout된 코드를 프로젝트 디렉토리에 동기화
+          rsync -a --delete --exclude='.venv' --exclude='__pycache__' --exclude='.env' \
+            "$GITHUB_WORKSPACE/" "$PROJECT_DIR/monglepick-agent/"
+
+          cd "$PROJECT_DIR"
 
           # Agent 컨테이너만 재빌드 + 재시작 (DB 건드리지 않음)
           docker compose -f docker-compose.staging.yml up -d --build --no-deps ai-agent

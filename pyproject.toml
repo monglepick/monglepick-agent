@@ -76,8 +76,8 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 
-[tool.uv]
-environments = ["sys_platform == 'darwin'"]
+# [tool.uv]
+# environments 제거 — CI/CD Ubuntu 러너에서 uv sync 실패 방지
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
