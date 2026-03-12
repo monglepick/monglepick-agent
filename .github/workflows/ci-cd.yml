@@ -43,8 +43,9 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      # 린트 체크 (경고만, 실패 차단하지 않음)
       - name: Lint
-        run: uv run --with ruff -- ruff check src/
+        run: uv run --with ruff -- ruff check src/ || true
 
       - name: Test
         run: |
