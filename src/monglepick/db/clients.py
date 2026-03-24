@@ -56,7 +56,7 @@ async def ensure_qdrant_collection() -> None:
     Qdrant 'movies' 컬렉션이 없으면 생성하고 payload 인덱스를 설정한다.
 
     §10-2-1 설정:
-    - 벡터 크기: 1024 (multilingual-e5-large)
+    - 벡터 크기: 4096 (Upstage Solar embedding-passage)
     - 거리 메트릭: Cosine
     - HNSW: M=16, ef_construct=100
     - Payload 인덱스: genres, director, mood_tags, release_year, rating, popularity_score, ott_platforms, title
@@ -72,8 +72,9 @@ async def ensure_qdrant_collection() -> None:
         await client.create_collection(
             collection_name=collection_name,
             vectors_config=VectorParams(
-                size=settings.EMBEDDING_DIMENSION,  # 1024
+                size=settings.EMBEDDING_DIMENSION,  # 4096 (Upstage Solar)
                 distance=Distance.COSINE,
+                on_disk=True,  # 벡터를 디스크(mmap)에 저장 (117만건 × 4096차원 메모리 절감)
             ),
             hnsw_config=HnswConfigDiff(
                 m=16,
@@ -326,6 +327,19 @@ ES_INDEX_SETTINGS = {
             "spoken_language_names": {"type": "keyword"},
             "cast_characters": {"type": "text", "analyzer": "korean_analyzer"},
             "embedding_text": {"type": "text", "analyzer": "korean_analyzer"},
+            # ── Phase D: 전체 수집 보강 필드 ──
+            # 다국어 줄거리 (번역 텍스트 검색 지원)
+            "overview_en": {"type": "text", "analyzer": "standard"},
+            "overview_ja": {"type": "text", "analyzer": "standard"},
+            # 소셜 미디어 ID (외부 연동용 필터링)
+            "facebook_id": {"type": "keyword"},
+            "instagram_id": {"type": "keyword"},
+            "twitter_id": {"type": "keyword"},
+            "wikidata_id": {"type": "keyword"},
+            # TMDB 리스트 포함 수 (인기도 보조 지표)
+            "tmdb_list_count": {"type": "integer"},
+            # 로고 이미지 경로 (UI 표시용)
+            "images_logos": {"type": "keyword"},
             # ── KOBIS 보강 필드 ──
             "kobis_movie_cd": {"type": "keyword"},
             "sales_acc": {"type": "long"},

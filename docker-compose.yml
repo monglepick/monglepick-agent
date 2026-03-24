@@ -12,7 +12,9 @@ services:
       - qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__LOG_LEVEL=INFO
-    mem_limit: 1g
+      # 벡터/페이로드를 디스크에 저장하여 메모리 사용량 절감 (117만건 × 4096차원 대응)
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
+    mem_limit: 6g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
       interval: 30s

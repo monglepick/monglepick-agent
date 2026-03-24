@@ -25,7 +25,6 @@ import binascii
 import io
 import re
 import time
-from collections import defaultdict
 
 import structlog
 from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -36,6 +35,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
 from monglepick.config import settings
+from monglepick.db.clients import get_redis
 
 logger = structlog.get_logger()
 
@@ -61,8 +61,9 @@ _vlm_semaphore = asyncio.Semaphore(settings.VLM_CONCURRENCY_LIMIT)
 # SSE로 "대기 중" 알림을 전송한다.
 _graph_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
 
-# IP당 업로드 타임스탬프 기록 (인메모리, Rate Limiting용)
-_upload_timestamps: defaultdict[str, list[float]] = defaultdict(list)
+# Rate Limiting: Redis 기반 슬라이딩 윈도우 (서버 재시작/멀티 인스턴스에서도 유지)
+_RATE_LIMIT_KEY_PREFIX: str = "rate_limit:upload:"
+_RATE_LIMIT_WINDOW_SEC: int = 60
 
 # Data URL 접두사 패턴: "data:image/jpeg;base64," 또는 "data:image/png;base64," 등
 _DATA_URL_RE = re.compile(r"^data:[^;]+;base64,", re.IGNORECASE)
@@ -124,12 +125,12 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
     raise ValueError("415:허용되지 않는 이미지 형식입니다. JPEG 또는 PNG만 지원합니다.")
 
 
-def _check_upload_rate_limit(client_ip: str) -> None:
+async def _check_upload_rate_limit(client_ip: str) -> None:
     """
-    IP당 분당 이미지 업로드 횟수를 제한한다.
+    IP당 분당 이미지 업로드 횟수를 Redis 기반 슬라이딩 윈도우로 제한한다.
 
-    인메모리 타임스탬프 리스트로 슬라이딩 윈도우 방식 Rate Limiting을 구현한다.
-    60초 이전의 타임스탬프는 자동 만료된다.
+    Redis Sorted Set을 사용하여 서버 재시작 및 멀티 인스턴스 환경에서도
+    Rate Limiting이 유지된다. 60초 이전의 타임스탬프는 자동 만료된다.
 
     Args:
         client_ip: 클라이언트 IP 주소
@@ -138,18 +139,42 @@ def _check_upload_rate_limit(client_ip: str) -> None:
         ValueError: 분당 업로드 한도 초과 시 (status_code=429)
     """
     now = time.time()
-    window_sec = 60.0
+    key = f"{_RATE_LIMIT_KEY_PREFIX}{client_ip}"
 
-    # 만료된 타임스탬프 제거 (60초 이전)
-    timestamps = _upload_timestamps[client_ip]
-    _upload_timestamps[client_ip] = [ts for ts in timestamps if now - ts < window_sec]
+    try:
+        redis = await get_redis()
 
-    # 한도 초과 확인
-    if len(_upload_timestamps[client_ip]) >= settings.IMAGE_UPLOAD_RATE_LIMIT:
-        raise ValueError("429:이미지 업로드 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")
+        # 파이프라인으로 원자적 실행: 만료 제거 → 카운트 조회 → 추가 → TTL 설정
+        pipe = redis.pipeline()
+        # 1. 윈도우 밖의 오래된 타임스탬프 제거
+        pipe.zremrangebyscore(key, 0, now - _RATE_LIMIT_WINDOW_SEC)
+        # 2. 현재 윈도우 내 요청 수 조회
+        pipe.zcard(key)
+        # 3. 현재 요청 타임스탬프 추가
+        pipe.zadd(key, {str(now): now})
+        # 4. 키 TTL 설정 (윈도우 + 여유 10초, 자동 정리)
+        pipe.expire(key, _RATE_LIMIT_WINDOW_SEC + 10)
+        results = await pipe.execute()
 
-    # 현재 요청 타임스탬프 기록
-    _upload_timestamps[client_ip].append(now)
+        # results[1] = zcard 결과 (추가 전 카운트)
+        current_count = results[1]
+
+        if current_count >= settings.IMAGE_UPLOAD_RATE_LIMIT:
+            # 한도 초과: 방금 추가한 타임스탬프 제거 (롤백)
+            await redis.zrem(key, str(now))
+            raise ValueError("429:이미지 업로드 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")
+
+    except ValueError:
+        # ValueError는 Rate Limit 초과 — 그대로 re-raise
+        raise
+    except Exception as e:
+        # Redis 연결 실패 시 요청을 차단하지 않고 경고만 남긴다 (graceful degradation)
+        logger.warning(
+            "rate_limit_redis_error",
+            client_ip=client_ip,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
 
 
 def _handle_security_error(error: ValueError) -> JSONResponse:
@@ -409,7 +434,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
         # Rate Limiting — IP당 분당 업로드 횟수 제한
         client_ip = raw_request.client.host if raw_request.client else "unknown"
         try:
-            _check_upload_rate_limit(client_ip)
+            await _check_upload_rate_limit(client_ip)
         except ValueError as e:
             return _handle_security_error(e)
 
@@ -445,8 +470,72 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — 글로벌 + VLM 세마포어로 동시 처리 제한 후 relay."""
+        """SSE 이벤트 생성기 — 포인트 체크 + 글로벌/VLM 세마포어로 동시 처리 제한 후 relay."""
         import json as _json
+
+        # ── 포인트 사전 체크 + 쿼터 검증 (익명 사용자는 생략) ──
+        # 과금 단위: "추천 완료" (movie_card 발행 시점)
+        # 사전 체크에서는 차감하지 않고 잔액/쿼터만 확인하여 조기 차단한다.
+        # AI 후속 질문만 하는 턴에서는 포인트가 차감되지 않는다.
+        # effective_cost: 실제 차감 포인트 (무료 잔여가 있으면 0). graph.py deduct에 전달.
+        from monglepick.config import settings as _settings
+        _effective_cost: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값 (체크 실패 시 사용)
+        if _settings.POINT_CHECK_ENABLED and request.user_id:
+            from monglepick.api.point_client import check_point
+            point_check = await check_point(
+                user_id=request.user_id,
+                cost=_settings.POINT_COST_PER_RECOMMENDATION,
+            )
+            # effective_cost를 로컬 변수에 저장 (graph.py deduct에 전달)
+            _effective_cost = point_check.effective_cost
+
+            # 1) 사용자 입력 글자수 제한 검증 (등급별 max_input_length)
+            message_text = request.message or ""
+            if len(message_text) > point_check.max_input_length:
+                logger.info(
+                    "chat_sse_input_too_long",
+                    user_id=request.user_id,
+                    max_input_length=point_check.max_input_length,
+                    current_length=len(message_text),
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": f"입력 글자수가 {point_check.max_input_length}자를 초과했습니다. (현재: {len(message_text)}자)",
+                        "error_code": "INPUT_TOO_LONG",
+                        "max_input_length": point_check.max_input_length,
+                        "current_length": len(message_text),
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
+            # 2) 포인트/쿼터 부족 → 그래프 실행 없이 에러 반환
+            if not point_check.allowed:
+                logger.info(
+                    "chat_sse_point_insufficient",
+                    user_id=request.user_id,
+                    balance=point_check.balance,
+                    cost=point_check.effective_cost,
+                    daily_used=point_check.daily_used,
+                    daily_limit=point_check.daily_limit,
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": point_check.message,
+                        "error_code": "INSUFFICIENT_POINT",
+                        "balance": point_check.balance,
+                        "cost": point_check.effective_cost,
+                        "needs_purchase": True,
+                        "daily_used": point_check.daily_used,
+                        "daily_limit": point_check.daily_limit,
+                        "monthly_used": point_check.monthly_used,
+                        "monthly_limit": point_check.monthly_limit,
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
 
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
         # 슬롯이 없으면 대기 중 SSE 알림을 먼저 전송
@@ -474,6 +563,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                         session_id=request.session_id,
                         message=request.message,
                         image_data=image_data,
+                        effective_cost=_effective_cost,
                     ):
                         yield sse_event
             else:
@@ -482,6 +572,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                     session_id=request.session_id,
                     message=request.message,
                     image_data=image_data,
+                    effective_cost=_effective_cost,
                 ):
                     yield sse_event
 
@@ -565,6 +656,7 @@ async def chat_sync(request: ChatRequest):
     )
 
     # 글로벌 그래프 세마포어 + VLM 세마포어로 동시 처리 제한
+    # 동기 엔드포인트는 디버그/테스트 전용 → 포인트 체크 없이 기본값(0) 전달
     async with _graph_semaphore:
         if image_for_agent:
             async with _vlm_semaphore:
@@ -573,6 +665,7 @@ async def chat_sync(request: ChatRequest):
                     session_id=request.session_id,
                     message=request.message,
                     image_data=image_for_agent,
+                    effective_cost=0,
                 )
         else:
             state = await run_chat_agent_sync(
@@ -580,6 +673,7 @@ async def chat_sync(request: ChatRequest):
                 session_id=request.session_id,
                 message=request.message,
                 image_data=image_for_agent,
+                effective_cost=0,
             )
 
     # State에서 응답 정보 추출
@@ -688,7 +782,7 @@ async def chat_upload(
         # Rate Limiting — IP당 분당 업로드 횟수 제한
         client_ip = raw_request.client.host if raw_request.client else "unknown"
         try:
-            _check_upload_rate_limit(client_ip)
+            await _check_upload_rate_limit(client_ip)
         except ValueError as e:
             return _handle_security_error(e)
 
@@ -736,8 +830,67 @@ async def chat_upload(
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — 글로벌 + VLM 세마포어로 동시 처리 제한 후 relay."""
+        """SSE 이벤트 생성기 — 포인트 체크 + 글로벌/VLM 세마포어로 동시 처리 제한 후 relay."""
         import json as _json
+
+        # ── 포인트 사전 체크 + 쿼터 검증 (업로드 엔드포인트) ──
+        from monglepick.config import settings as _settings
+        _effective_cost_upload: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값
+        if _settings.POINT_CHECK_ENABLED and user_id:
+            from monglepick.api.point_client import check_point
+            point_check = await check_point(
+                user_id=user_id,
+                cost=_settings.POINT_COST_PER_RECOMMENDATION,
+            )
+            # effective_cost를 로컬 변수에 저장 (graph.py deduct에 전달)
+            _effective_cost_upload = point_check.effective_cost
+
+            # 1) 사용자 입력 글자수 제한 검증 (등급별 max_input_length)
+            if len(message) > point_check.max_input_length:
+                logger.info(
+                    "chat_upload_input_too_long",
+                    user_id=user_id,
+                    max_input_length=point_check.max_input_length,
+                    current_length=len(message),
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": f"입력 글자수가 {point_check.max_input_length}자를 초과했습니다. (현재: {len(message)}자)",
+                        "error_code": "INPUT_TOO_LONG",
+                        "max_input_length": point_check.max_input_length,
+                        "current_length": len(message),
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
+            # 2) 포인트/쿼터 부족 → 그래프 실행 없이 에러 반환
+            if not point_check.allowed:
+                logger.info(
+                    "chat_upload_point_insufficient",
+                    user_id=user_id,
+                    balance=point_check.balance,
+                    cost=point_check.effective_cost,
+                    daily_used=point_check.daily_used,
+                    daily_limit=point_check.daily_limit,
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": point_check.message,
+                        "error_code": "INSUFFICIENT_POINT",
+                        "balance": point_check.balance,
+                        "cost": point_check.effective_cost,
+                        "needs_purchase": True,
+                        "daily_used": point_check.daily_used,
+                        "daily_limit": point_check.daily_limit,
+                        "monthly_used": point_check.monthly_used,
+                        "monthly_limit": point_check.monthly_limit,
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
 
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
         if _graph_semaphore.locked():
@@ -763,6 +916,7 @@ async def chat_upload(
                         session_id=session_id,
                         message=message,
                         image_data=image_data,
+                        effective_cost=_effective_cost_upload,
                     ):
                         yield sse_event
             else:
@@ -771,6 +925,7 @@ async def chat_upload(
                     session_id=session_id,
                     message=message,
                     image_data=image_data,
+                    effective_cost=_effective_cost_upload,
                 ):
                     yield sse_event
 

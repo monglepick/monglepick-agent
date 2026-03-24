@@ -1,7 +1,7 @@
 """
 Chat Agent LangGraph StateGraph 구성 (§6-2).
 
-13노드 + 4개 조건부 라우팅 함수로 구성된 Chat Agent 그래프.
+14노드 + 4개 조건부 라우팅 함수로 구성된 Chat Agent 그래프.
 SSE 스트리밍과 동기 실행 인터페이스를 제공한다.
 Redis 세션 저장소를 통해 멀티턴 대화 상태를 영속화한다.
 
@@ -16,7 +16,7 @@ Redis 세션 저장소를 통해 멀티턴 대화 상태를 영속화한다.
           ├─ recommend/search → preference_refiner
           │   → route_after_preference (조건부 분기)
           │       ├─ needs_clarification=True  → question_generator → response_formatter → END
-          │       └─ needs_clarification=False → query_builder → rag_retriever
+          │       └─ needs_clarification=False → query_builder → rag_retriever → retrieval_quality_checker
           │            → route_after_retrieval (조건부 분기)
           │                ├─ 품질 OK → recommendation_ranker → explanation_generator → response_formatter → END
           │                └─ 품질 미달 → question_generator → response_formatter → END
@@ -69,6 +69,7 @@ from monglepick.agents.chat.nodes import (
     rag_retriever,
     recommendation_ranker,
     response_formatter,
+    retrieval_quality_checker,
     tool_executor_node,
 )
 
@@ -237,7 +238,9 @@ def build_chat_graph() -> StateGraph:
     """
     Chat Agent StateGraph를 구성하고 컴파일한다.
 
-    13개 노드와 4개 조건부 분기를 등록하여 영화 추천 대화 흐름을 정의한다.
+    14개 노드와 4개 조건부 분기를 등록하여 영화 추천 대화 흐름을 정의한다.
+    retrieval_quality_checker는 rag_retriever와 route_after_retrieval 사이에서
+    검색 품질을 판정하여 state에 기록하는 독립 노드이다.
 
     Returns:
         컴파일된 StateGraph (CompiledGraph)
@@ -245,14 +248,15 @@ def build_chat_graph() -> StateGraph:
     # StateGraph 생성 (ChatAgentState TypedDict 기반)
     graph = StateGraph(ChatAgentState)
 
-    # ── 노드 등록 (13개) ──
+    # ── 노드 등록 (14개) ──
     graph.add_node("context_loader", context_loader)
     graph.add_node("image_analyzer", image_analyzer)
     graph.add_node("intent_emotion_classifier", intent_emotion_classifier)
     graph.add_node("preference_refiner", preference_refiner)
     graph.add_node("question_generator", question_generator)
     graph.add_node("query_builder", query_builder)
-    graph.add_node("rag_retriever", _rag_retriever_with_quality_check)
+    graph.add_node("rag_retriever", rag_retriever)
+    graph.add_node("retrieval_quality_checker", retrieval_quality_checker)
     graph.add_node("recommendation_ranker", recommendation_ranker)
     graph.add_node("explanation_generator", explanation_generator)
     graph.add_node("response_formatter", response_formatter)
@@ -301,10 +305,11 @@ def build_chat_graph() -> StateGraph:
     # 후속 질문 흐름: question_generator → response_formatter → END
     graph.add_edge("question_generator", "response_formatter")
 
-    # 추천 진행 흐름: query_builder → rag_retriever → route_after_retrieval (조건부)
+    # 추천 진행 흐름: query_builder → rag_retriever → retrieval_quality_checker → 조건부 분기
     graph.add_edge("query_builder", "rag_retriever")
+    graph.add_edge("rag_retriever", "retrieval_quality_checker")
     graph.add_conditional_edges(
-        "rag_retriever",
+        "retrieval_quality_checker",
         route_after_retrieval,
         {
             "recommendation_ranker": "recommendation_ranker",
@@ -330,55 +335,8 @@ def build_chat_graph() -> StateGraph:
 
     # 그래프 컴파일
     compiled = graph.compile()
-    logger.info("chat_graph_compiled", node_count=13)
+    logger.info("chat_graph_compiled", node_count=14)
     return compiled
-
-
-async def _rag_retriever_with_quality_check(state: ChatAgentState) -> dict:
-    """
-    rag_retriever 래퍼: 검색 실행 후 품질 판정 결과를 state에 기록한다.
-
-    route_after_retrieval 라우터가 state를 수정할 수 없으므로,
-    검색 결과를 기반으로 retrieval_quality_passed와 retrieval_feedback을
-    이 노드에서 미리 설정한다.
-
-    Args:
-        state: ChatAgentState
-
-    Returns:
-        dict: candidate_movies, retrieval_quality_passed, retrieval_feedback 업데이트
-    """
-    # 실제 rag_retriever 노드 호출
-    result = await rag_retriever(state)
-    candidates = result.get("candidate_movies", [])
-
-    # 검색 품질 판정
-    num_candidates = len(candidates)
-    top_score = candidates[0].rrf_score if candidates else 0.0
-    avg_score = (
-        sum(c.rrf_score for c in candidates[:5]) / min(len(candidates), 5)
-        if candidates else 0.0
-    )
-
-    quality_passed = (
-        num_candidates >= RETRIEVAL_MIN_CANDIDATES
-        and top_score >= RETRIEVAL_MIN_TOP_SCORE
-        and avg_score >= RETRIEVAL_QUALITY_MIN_AVG
-    )
-
-    # 품질 미달 시 피드백 메시지 생성
-    feedback = ""
-    if not quality_passed:
-        if num_candidates == 0:
-            feedback = "조건에 맞는 영화를 찾지 못했어요."
-        elif top_score < RETRIEVAL_MIN_TOP_SCORE:
-            feedback = "조건과 딱 맞는 영화를 찾기 어려웠어요."
-        else:
-            feedback = "검색 결과가 충분하지 않아요."
-
-    result["retrieval_quality_passed"] = quality_passed
-    result["retrieval_feedback"] = feedback
-    return result
 
 
 # ── 모듈 레벨 싱글턴: 컴파일 1회 ──
@@ -397,6 +355,7 @@ NODE_STATUS_MESSAGES: dict[str, str] = {
     "question_generator": "질문을 준비하고 있어요...",
     "query_builder": "검색 조건을 구성하고 있어요...",
     "rag_retriever": "영화를 검색하고 있어요... 🔍",
+    "retrieval_quality_checker": "검색 결과 품질을 확인하고 있어요...",
     "recommendation_ranker": "최적의 영화를 고르고 있어요...",
     "explanation_generator": "추천 이유를 작성하고 있어요...",
     "response_formatter": "응답을 정리하고 있어요...",
@@ -446,6 +405,9 @@ def _predict_next_node(completed_node: str, state: dict) -> tuple[str, str] | No
             # query_builder → rag_retriever (고정 엣지)
             next_node = "rag_retriever"
         elif completed_node == "rag_retriever":
+            # rag_retriever → retrieval_quality_checker (고정 엣지)
+            next_node = "retrieval_quality_checker"
+        elif completed_node == "retrieval_quality_checker":
             next_node = route_after_retrieval(state)
         elif completed_node == "recommendation_ranker":
             # recommendation_ranker → explanation_generator (고정 엣지)
@@ -490,6 +452,7 @@ async def run_chat_agent(
     session_id: str,
     message: str,
     image_data: str | None = None,
+    effective_cost: int = 0,
 ) -> AsyncGenerator[str, None]:
     """
     Chat Agent를 SSE 스트리밍 모드로 실행한다.
@@ -520,6 +483,8 @@ async def run_chat_agent(
         session_id: 세션 ID (빈 문자열이면 자동 생성)
         message: 사용자 입력 메시지
         image_data: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+        effective_cost: 실제 차감 포인트 (chat.py에서 쿼터 체크 후 전달).
+            무료 잔여가 있으면 0이 전달되어 deduct 호출을 스킵한다.
 
     Yields:
         SSE 이벤트 JSON 문자열 (줄바꿈 포함)
@@ -659,12 +624,61 @@ async def run_chat_agent(
                     if response_text:
                         yield _format_sse_event("token", {"delta": response_text})
 
-                # recommendation_ranker 완료 시 movie_card 이벤트 발행
+                # recommendation_ranker 완료 시: 포인트 차감 → movie_card 이벤트 발행
+                # 과금 단위: "추천 완료" (movie_card 발행 시점에만 1회 차감)
+                # AI의 후속 질문(clarification) 턴은 과금하지 않음
+                # effective_cost=0이면 무료 잔여로 커버된 요청이므로 차감 스킵
                 if node_name == "recommendation_ranker":
                     ranked_movies = updates.get("ranked_movies", [])
-                    for movie in ranked_movies:
-                        movie_data = movie.model_dump() if hasattr(movie, "model_dump") else movie
-                        yield _format_sse_event("movie_card", movie_data)
+                    if ranked_movies:
+                        # ── 포인트 차감 (추천 결과가 있고, effective_cost > 0일 때만) ──
+                        from monglepick.config import settings
+                        if settings.POINT_CHECK_ENABLED and user_id and effective_cost > 0:
+                            from monglepick.api.point_client import deduct_point
+                            deduct_result = await deduct_point(
+                                user_id=user_id,
+                                session_id=session_id,
+                                amount=effective_cost,
+                                description="AI 추천 사용",
+                            )
+                            if deduct_result.success:
+                                # 차감 성공: 잔여 포인트 정보를 SSE로 전달
+                                yield _format_sse_event("point_update", {
+                                    "balance": deduct_result.balance_after,
+                                    "deducted": effective_cost,
+                                })
+                                logger.info(
+                                    "point_deducted",
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                    deducted=effective_cost,
+                                    balance_after=deduct_result.balance_after,
+                                )
+                            else:
+                                # 차감 실패해도 추천은 전달 (graceful degradation)
+                                logger.warning(
+                                    "point_deduct_failed_graceful",
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                    effective_cost=effective_cost,
+                                )
+                        elif settings.POINT_CHECK_ENABLED and user_id and effective_cost == 0:
+                            # 무료 잔여로 커버된 요청 → 차감 없이 point_update 발행
+                            logger.info(
+                                "point_free_usage",
+                                user_id=user_id,
+                                session_id=session_id,
+                            )
+                            yield _format_sse_event("point_update", {
+                                "balance": -1,  # 무료 사용 시 잔액 미변동 (-1은 미조회)
+                                "deducted": 0,
+                                "free_usage": True,
+                            })
+
+                        # movie_card 이벤트 발행
+                        for movie in ranked_movies:
+                            movie_data = movie.model_dump() if hasattr(movie, "model_dump") else movie
+                            yield _format_sse_event("movie_card", movie_data)
 
         # 5. 그래프 완료 후 세션 저장
         merged_state = {**initial_state, **final_state}
@@ -718,6 +732,7 @@ async def run_chat_agent_sync(
     session_id: str,
     message: str,
     image_data: str | None = None,
+    effective_cost: int = 0,
 ) -> ChatAgentState:
     """
     Chat Agent를 동기 모드로 실행하여 최종 State를 반환한다 (테스트/디버그용).
@@ -730,6 +745,7 @@ async def run_chat_agent_sync(
         session_id: 세션 ID (빈 문자열이면 자동 생성)
         message: 사용자 입력 메시지
         image_data: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+        effective_cost: 실제 차감 포인트 (동기 엔드포인트는 디버그용이므로 기본값 0)
 
     Returns:
         실행 완료된 ChatAgentState (session_id 포함)
