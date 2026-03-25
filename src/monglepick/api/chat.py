@@ -70,6 +70,9 @@ _RATE_LIMIT_WINDOW_SEC: int = 60
 # Data URL 접두사 패턴: "data:image/jpeg;base64," 또는 "data:image/png;base64," 등
 _DATA_URL_RE = re.compile(r"^data:[^;]+;base64,", re.IGNORECASE)
 
+# Pillow DecompressionBomb 방어: 모듈 로드 시 1회만 설정 (C-4)
+Image.MAX_IMAGE_PIXELS = settings.IMAGE_MAX_PIXELS
+
 
 # ============================================================
 # JWT 검증 (Client → Agent 요청의 user_id 위조 방지)
@@ -328,9 +331,6 @@ def _resize_image_bytes(
     original_size = len(image_bytes)
 
     try:
-        # DecompressionBomb 방어: 허용 최대 픽셀 수 설정
-        Image.MAX_IMAGE_PIXELS = settings.IMAGE_MAX_PIXELS
-
         img = Image.open(io.BytesIO(image_bytes))
 
         # EXIF 회전 보정 (사진이 90/180/270도 회전된 경우 정상 방향으로 복원)
@@ -638,8 +638,9 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
 
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
         # 슬롯이 없으면 대기 중 SSE 알림을 먼저 전송
+        # 참고(C-3): locked()와 async with 사이에 경쟁 조건이 있을 수 있으나
+        # UX 힌트 메시지 부정확만 발생하며 기능에는 영향 없음
         if _graph_semaphore.locked():
-            # 대기 중임을 사용자에게 SSE로 알림
             yield {
                 "event": "status",
                 "data": _json.dumps(
@@ -1001,6 +1002,8 @@ async def chat_upload(
                 return
 
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
+        # 참고(C-3): locked()와 async with 사이에 경쟁 조건이 있을 수 있으나
+        # UX 힌트 메시지 부정확만 발생하며 기능에는 영향 없음
         if _graph_semaphore.locked():
             yield {
                 "event": "status",
