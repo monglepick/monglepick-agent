@@ -13,7 +13,7 @@ dependencies = [
     # ── LLM / Agent ──
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",
-    "langchain-openai>=0.2.0",
+    "langchain-ollama>=0.2.0",
     "langchain-anthropic>=0.3.0",
     "langchain-community>=0.3.0",
     "langgraph>=0.2.0",
@@ -35,8 +35,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.0",
     "cryptography>=43.0.0",
     # ── Embedding (Upstage Solar — OpenAI 호환 API 사용) ──
-    # ── Ollama (로컬 LLM) ──
-    "langchain-ollama>=0.3.0",
+    # ── Ollama (로컬 LLM, langchain-ollama 사용) ──
+    # langchain-ollama는 위에 이미 포함되어 있음
     # ── Image Processing ──
     "Pillow>=10.0.0",
     # ── Data Pipeline ──

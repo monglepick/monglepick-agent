@@ -2,11 +2,11 @@
 테스트 공통 Fixture (Phase 2 LLM 체인 + Phase 3 Chat Agent + 의도+감정 통합 테스트용).
 
 모든 테스트는 Ollama/DB 서버 없이 mock 기반으로 실행된다.
-ChatOllama, MySQL, hybrid_search, image_analysis, classify_intent_and_emotion을
+ChatOllama(Ollama), MySQL, hybrid_search, image_analysis, classify_intent_and_emotion을
 패치하여 사전 정의된 응답을 반환한다.
 
 Fixture 목록:
-- mock_ollama: ChatOllama 패치 (ainvoke가 preset 응답 반환)
+- mock_ollama: ChatOllama(Ollama) 패치 (ainvoke가 preset 응답 반환)
 - mock_mysql: aiomysql Pool/Connection/Cursor mock (get_mysql 패치)
 - mock_hybrid_search: hybrid_search 함수 mock (기본 빈 결과)
 - mock_image_analysis: analyze_image 함수 mock (이미지 분석 결과)
@@ -107,7 +107,7 @@ def _create_mock_llm_response(content: str) -> MagicMock:
 @pytest.fixture
 def mock_ollama():
     """
-    ChatOllama를 패치하여 Ollama 서버 없이 테스트한다.
+    ChatOllama(Ollama)를 패치하여 Ollama 서버 없이 테스트한다.
 
     사용법:
         def test_something(mock_ollama):
@@ -119,7 +119,7 @@ def mock_ollama():
     """
 
     class MockOllamaController:
-        """Mock ChatOllama 컨트롤러."""
+        """Mock ChatOllama(Ollama) 컨트롤러."""
 
         def __init__(self):
             self._response_content = "mock response"
@@ -188,7 +188,7 @@ def mock_ollama():
 
     controller = MockOllamaController()
 
-    # ChatOllama 생성자를 패치하여 mock 인스턴스를 반환
+    # ChatOllama 생성자를 패치하여 mock 인스턴스를 반환 (Ollama 서버 불필요)
     with patch("monglepick.llm.factory.ChatOllama", return_value=controller._mock_instance):
         # LLM 캐시 초기화 (테스트 간 격리)
         import monglepick.llm.factory as factory_module
@@ -520,7 +520,7 @@ def mock_image_analysis():
 @pytest.fixture
 def mock_intent_emotion():
     """
-    classify_intent_and_emotion 함수를 mock하여 Ollama 서버 없이 통합 분류를 테스트한다.
+    classify_intent_and_emotion 함수를 mock하여 vLLM 서버 없이 통합 분류를 테스트한다.
 
     기본 동작: recommend 의도 + happy 감정 + 유쾌 무드 태그
 

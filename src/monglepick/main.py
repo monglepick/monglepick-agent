@@ -3,7 +3,7 @@
 
 Phase 3: lifespan 추가 (5개 DB 클라이언트 초기화/종료), chat_router 등록.
 LangSmith: LANGCHAIN_API_KEY 설정 시 LLM 호출/그래프 실행 자동 트레이싱.
-Ollama Warmup: 앱 시작 시 두 모델(qwen3.5, exaone-32b)을 사전 로드하여 첫 요청 cold start 제거.
+Ollama Warmup: 앱 시작 시 두 모델(qwen3.5, exaone-32b)에 dummy 호출하여 첫 요청 cold start 제거.
 """
 
 import asyncio
@@ -44,18 +44,15 @@ APP_VERSION = "0.3.0"
 
 async def _warmup_ollama_models() -> None:
     """
-    Ollama 모델을 사전 로드하여 첫 API 요청의 cold start를 제거한다.
+    Ollama 모델에 dummy 호출을 수행하여 첫 API 요청의 cold start를 제거한다.
 
-    Ollama는 첫 호출 시 모델을 GPU에 로드하는 데 30~90초가 걸린다.
+    Ollama 서버가 모델을 처음 로드할 때 시간이 소요될 수 있다.
     앱 시작 시 짧은 dummy 호출을 수행하면 사용자 첫 요청 전에
-    이미 GPU에 모델이 올라가 있어 즉시 추론 가능.
+    모델이 완전히 준비된다.
 
-    두 모델을 순차적으로 로드한다:
+    두 모델을 순차적으로 warmup한다:
     1. qwen3.5:35b-a3b (의도+감정 분류, 이미지 분석)
     2. exaone-32b:latest (선호 추출, 대화, 추천 이유)
-
-    OLLAMA_MAX_LOADED_MODELS=2 환경변수가 설정되어 있어야
-    두 모델이 동시에 GPU에 유지된다 (모델 스왑 방지).
 
     warmup 실패 시에도 앱은 정상 기동한다 (에러 전파 금지).
     """
@@ -64,6 +61,7 @@ async def _warmup_ollama_models() -> None:
     from monglepick.llm.factory import get_llm
 
     # 사전 로드할 모델 목록 (중복 제거)
+    # Ollama 단일 서버에 dummy 호출을 수행하여 모델을 로드한다.
     models_to_warmup: list[str] = []
     seen: set[str] = set()
     for model_name in [settings.INTENT_MODEL, settings.CONVERSATION_MODEL]:
@@ -74,18 +72,17 @@ async def _warmup_ollama_models() -> None:
     logger.info(
         "ollama_warmup_start",
         models=models_to_warmup,
-        max_loaded_models=settings.OLLAMA_MAX_LOADED_MODELS,
     )
 
     for model_name in models_to_warmup:
         warmup_start = time.perf_counter()
         try:
-            # 짧은 dummy 호출로 모델을 GPU에 로드한다.
+            # 짧은 dummy 호출로 모델 warmup.
             # temperature=0.1, num_predict=1로 최소 토큰만 생성하여 빠르게 완료.
             llm = get_llm(model=model_name, temperature=0.1, num_predict=1)
             await asyncio.wait_for(
                 llm.ainvoke([HumanMessage(content="ping")]),
-                timeout=120.0,  # 모델 로딩 포함 최대 2분 대기
+                timeout=120.0,  # 최대 2분 대기
             )
             elapsed_sec = time.perf_counter() - warmup_start
             logger.info(
@@ -127,18 +124,7 @@ async def lifespan(app: FastAPI):
     startup_start = time.perf_counter()
     logger.info("app_startup", version=APP_VERSION)
 
-    # ── [1] OLLAMA_MAX_LOADED_MODELS 환경변수 설정 ──
-    # Ollama 서버가 동시에 GPU에 유지할 모델 수를 설정한다.
-    # Mac 64GB 통합 메모리에서 qwen3.5(~20GB) + exaone-32b(~20GB) 동시 로드 가능.
-    # 이 환경변수가 없으면 Ollama는 기본적으로 1개 모델만 유지하여
-    # 매 요청마다 모델 스왑(30~90초)이 발생한다.
-    os.environ["OLLAMA_MAX_LOADED_MODELS"] = str(settings.OLLAMA_MAX_LOADED_MODELS)
-    logger.info(
-        "ollama_max_loaded_models_set",
-        value=settings.OLLAMA_MAX_LOADED_MODELS,
-    )
-
-    # ── [2] 5개 DB 클라이언트 초기화 ──
+    # ── [1] 5개 DB 클라이언트 초기화 ──
     try:
         await init_all_clients()
         db_elapsed_ms = (time.perf_counter() - startup_start) * 1000
@@ -151,7 +137,7 @@ async def lifespan(app: FastAPI):
             stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
         )
 
-    # ── [2.5] 보안 설정 점검 ──
+    # ── [1.5] 보안 설정 점검 ──
     # JWT_SECRET 미설정 시 경고: 프로덕션에서는 JWT 검증이 비활성화됨
     if not settings.JWT_SECRET:
         logger.warning(
@@ -159,9 +145,8 @@ async def lifespan(app: FastAPI):
             message="JWT_SECRET이 설정되지 않았습니다. JWT 검증이 비활성화됩니다. (개발 환경 전용)",
         )
 
-    # ── [3] Ollama 모델 사전 로드 (warmup) ──
-    # 앱 시작 시 두 모델에 dummy 호출을 수행하여 GPU에 미리 로드한다.
-    # 이를 통해 사용자 첫 요청에서 cold start(30~90초)를 제거한다.
+    # ── [2] Ollama 모델 warmup ──
+    # 앱 시작 시 두 모델에 dummy 호출을 수행하여 cold start를 제거한다.
     await _warmup_ollama_models()
 
     startup_elapsed_ms = (time.perf_counter() - startup_start) * 1000

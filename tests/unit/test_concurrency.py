@@ -128,7 +128,7 @@ class TestConcurrencyLimit:
         await asyncio.wait_for(task, timeout=1.0)
         assert acquired.is_set()
 
-        # 정리
+        # 정리 (나머지 슬롯 반환)
         release_model_slot(model)
         release_model_slot(model)
 
@@ -276,7 +276,7 @@ class TestGraphSemaphore:
         assert settings.MAX_CONCURRENT_REQUESTS == 3
 
     def test_llm_per_model_concurrency_default(self):
-        """LLM_PER_MODEL_CONCURRENCY 기본값이 2이다."""
+        """LLM_PER_MODEL_CONCURRENCY 기본값이 2이다 (Ollama GPU 메모리 보호)."""
         assert settings.LLM_PER_MODEL_CONCURRENCY == 2
 
     def test_max_explanation_movies_default(self):
