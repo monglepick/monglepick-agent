@@ -1,7 +1,7 @@
 """
 프로젝트 설정 (pydantic-settings 기반).
 
-§17 Phase 0: 27개 환경 변수 + Ollama 로컬 LLM 설정 추가.
+§17 Phase 0: 27개 환경 변수 + Ollama(로컬 LLM) 설정.
 .env 파일에서 환경 변수를 로드한다.
 """
 
@@ -35,11 +35,9 @@ class Settings(BaseSettings):
     KMDB_BASE_URL: str = "http://api.koreafilm.or.kr/openapi-data2/wisenut/search_api/search_json2.jsp"
 
     # ── Ollama (로컬 LLM 서버) ──
+    # Ollama는 단일 서버에서 OLLAMA_MAX_LOADED_MODELS 수만큼 모델을 동시 로드한다.
+    # Mac 64GB 기준: qwen3.5:35b-a3b + exaone-32b 동시 로드 가능 (2모델)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    # 동시에 GPU에 로드할 수 있는 최대 모델 수.
-    # Mac 64GB 통합 메모리에서 qwen3.5:35b-a3b + exaone-32b 2개 동시 로드 가능.
-    # 1이면 모델 스왑이 발생하여 매 요청 30~90초 추가 지연.
-    OLLAMA_MAX_LOADED_MODELS: int = 2
 
     # ── Qdrant ──
     QDRANT_URL: str = "http://localhost:6333"
@@ -68,6 +66,9 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 4096
 
     # ── LLM Models (Ollama 로컬 모델) ──
+    # 모델명은 ollama pull/run 시 사용하는 이름과 일치해야 한다.
+    # 예: ollama pull qwen3.5:35b-a3b, ollama pull exaone-32b:latest
+    #
     # 구조화 출력 (JSON) + 비전: Qwen3.5 35B-A3B (텍스트 분류 + 이미지 분석 통합)
     INTENT_MODEL: str = "qwen3.5:35b-a3b"
     EMOTION_MODEL: str = "qwen3.5:35b-a3b"
@@ -75,7 +76,7 @@ class Settings(BaseSettings):
     # 한국어 자연어 생성: EXAONE 4.0 32B (비추론 모드: temperature < 0.6)
     PREFERENCE_MODEL: str = "exaone-32b:latest"
     CONVERSATION_MODEL: str = "exaone-32b:latest"
-    # 경량 한국어 생성: EXAONE 4.0 32B (1.2B 미다운로드, 32B로 대체)
+    # 경량 한국어 생성: EXAONE 4.0 32B
     QUESTION_MODEL: str = "exaone-32b:latest"
     # 추천 이유 생성: EXAONE 4.0 32B (자연어 설명)
     EXPLANATION_MODEL: str = "exaone-32b:latest"
@@ -137,12 +138,11 @@ class Settings(BaseSettings):
     # 초과 요청은 큐에 대기하며 SSE로 "대기 중" 알림을 전송한다.
     MAX_CONCURRENT_REQUESTS: int = 3
     # Ollama 모델별 동시 LLM 호출 제한.
-    # Ollama는 GPU 추론을 모델당 직렬 처리하므로, 2 이상이면 큐 점유만 증가.
-    # 1 = 활성 추론 1개 + 대기 1개 허용 (모델 스왑 방지)
+    # Ollama는 GPU 메모리 내에서 동시 요청을 처리하지만,
+    # 과부하 방지를 위해 모델별 동시 호출 수를 제한한다.
     LLM_PER_MODEL_CONCURRENCY: int = 2
     # 추천 이유를 LLM으로 생성할 최대 영화 수.
-    # 초과 영화는 메타데이터 기반 템플릿(_build_fallback_explanation)으로 대체하여
-    # Ollama 큐 점유를 줄인다.
+    # 초과 영화는 메타데이터 기반 템플릿(_build_fallback_explanation)으로 대체.
     MAX_EXPLANATION_MOVIES: int = 3
 
     # ── Retrieval Quality Thresholds (RAG 검색 품질 판정) ──

@@ -796,10 +796,10 @@ async def generate_mood_tags(
         overview=overview[:200],
     )
 
-    # Ollama OpenAI 호환 API 사용
+    # Ollama OpenAI 호환 API 사용 (무드태그 생성은 Qwen 모델)
     client = AsyncOpenAI(
         base_url=f"{settings.OLLAMA_BASE_URL}/v1",
-        api_key="ollama",  # Ollama는 API 키 불필요, 더미값
+        api_key="ollama",
     )
 
     for attempt in range(2):  # 최대 2회 시도 (1회 재시도)
@@ -1045,7 +1045,7 @@ async def process_raw_movie(raw: TMDBRawMovie, generate_mood: bool = True) -> Mo
         source="tmdb",
     )
 
-    # 무드태그 생성 (Ollama qwen2.5:14b 사용)
+    # 무드태그 생성 (Ollama Qwen 모델 사용)
     if generate_mood and settings.OLLAMA_BASE_URL:
         doc.mood_tags = await generate_mood_tags(doc.title, genres, keywords, doc.overview)
     else:

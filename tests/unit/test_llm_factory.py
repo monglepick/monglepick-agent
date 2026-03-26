@@ -26,7 +26,7 @@ class TestGetLlm:
         factory_module._structured_cache.clear()
 
     def test_creates_chat_ollama_with_correct_params(self):
-        """ChatOllama가 올바른 파라미터로 생성된다."""
+        """ChatOllama(Ollama)가 올바른 파라미터로 생성된다."""
         with patch("monglepick.llm.factory.ChatOllama") as mock_cls:
             mock_cls.return_value = MagicMock()
             llm = factory_module.get_llm(
@@ -67,7 +67,7 @@ class TestGetLlm:
             assert llm1 is not llm2
 
     def test_default_values(self):
-        """기본값이 settings.CONVERSATION_MODEL, temp=0.5이다."""
+        """기본값이 settings.CONVERSATION_MODEL, temp=0.5, OLLAMA_BASE_URL이다."""
         with patch("monglepick.llm.factory.ChatOllama") as mock_cls:
             mock_cls.return_value = MagicMock()
             factory_module.get_llm()

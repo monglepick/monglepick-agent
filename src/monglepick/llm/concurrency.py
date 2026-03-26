@@ -1,8 +1,8 @@
 """
 모델별 동시성 제어 모듈.
 
-Ollama는 GPU 추론을 모델당 직렬 처리하므로,
-동일 모델에 대한 동시 LLM 호출 수를 세마포어로 제한한다.
+Ollama는 OLLAMA_MAX_LOADED_MODELS로 복수 모델을 동시 로드하지만,
+GPU 메모리 한계를 고려하여 동시 호출 수를 세마포어로 제한한다.
 
 모델명을 키로 asyncio.Semaphore를 관리하며,
 acquire 시 대기 시간을 측정하여 structlog로 로깅한다.

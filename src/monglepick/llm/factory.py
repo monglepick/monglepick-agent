@@ -1,12 +1,17 @@
 """
-LLM 팩토리 — ChatOllama 인스턴스 생성 및 캐싱.
+LLM 팩토리 — ChatOllama(Ollama) 인스턴스 생성 및 캐싱.
 
-로컬 Ollama 서버의 LLM 모델을 용도별로 생성하는 팩토리 함수 모음.
+Ollama 서버의 API를 통해 LLM 모델을 용도별로 생성하는 팩토리 함수 모음.
 동일 파라미터 조합에 대해 싱글턴 캐싱을 적용하여 중복 인스턴스 생성을 방지한다.
 
+Ollama는 단일 서버(기본 포트 11434)에서 복수 모델을 동시에 서빙한다.
+OLLAMA_MAX_LOADED_MODELS 환경변수로 동시 로드 모델 수를 제어한다.
+  - format="json": Ollama 네이티브 JSON 모드 (구조화 출력 강제)
+  - 구조화 출력: with_structured_output(schema)으로 Pydantic 모델 자동 검증
+
 모델 라우팅:
-- 구조화 출력 (intent, emotion): Qwen 14B (정확한 JSON 생성)
-- 한국어 생성 (preference, conversation, question, explanation): EXAONE 32B
+- 구조화 분류 (intent, emotion, vision): Qwen3.5 35B-A3B
+- 한국어 생성 (preference, conversation, question, explanation): EXAONE 4.0 32B
 - 구조화 출력은 with_structured_output(schema)으로 Pydantic 모델 자동 검증
 
 캐싱:
@@ -50,25 +55,26 @@ def get_llm(
     num_predict: int | None = None,
 ) -> ChatOllama:
     """
-    ChatOllama 인스턴스를 생성하거나 캐시에서 반환한다.
+    ChatOllama(Ollama) 인스턴스를 생성하거나 캐시에서 반환한다.
 
+    Ollama 서버에 연결하여 LLM 모델을 사용한다.
     동일 (model, temperature, format) 조합은 싱글턴으로 재사용된다.
     num_predict는 캐시 키에 포함되지 않으며, 호출 시마다 적용할 수 있다.
 
     Args:
         model: Ollama 모델명 (기본값: settings.CONVERSATION_MODEL)
         temperature: 생성 온도 (기본값: 0.5)
-        format: 응답 형식 ("json" 또는 None)
+        format: 응답 형식 ("json" 또는 None). "json"이면 Ollama JSON 모드 적용
         num_predict: 최대 생성 토큰 수 (None이면 모델 기본값)
 
     Returns:
-        ChatOllama 인스턴스
+        ChatOllama 인스턴스 (Ollama 백엔드)
     """
     # 기본값 설정
     model = model or settings.CONVERSATION_MODEL
     temperature = temperature if temperature is not None else 0.5
 
-    # 캐시 키 생성
+    # 캐시 키 생성 (단일 서버이므로 base_url 불포함)
     cache_key = (model, temperature, format)
 
     # RLock으로 동시 호출 시 중복 인스턴스 생성 방지
@@ -80,8 +86,9 @@ def get_llm(
                 "temperature": temperature,
                 "base_url": settings.OLLAMA_BASE_URL,
             }
-            if format is not None:
-                kwargs["format"] = format
+            # Ollama에서 JSON 형식 응답을 강제하려면 format="json" 사용
+            if format == "json":
+                kwargs["format"] = "json"
             if num_predict is not None:
                 kwargs["num_predict"] = num_predict
 
@@ -115,7 +122,7 @@ def get_structured_llm(
     """
     구조화 출력(Pydantic 모델 자동 검증) LLM을 반환한다.
 
-    ChatOllama에 .with_structured_output(schema, method="json_schema")를 적용하여
+    ChatOllama에 .with_structured_output(schema)를 적용하여
     LLM 응답을 자동으로 Pydantic 모델로 파싱한다.
 
     Args:
@@ -138,7 +145,7 @@ def get_structured_llm(
         if cache_key not in _structured_cache:
             # 기본 ChatOllama 인스턴스 가져오기
             llm = get_llm(model=model, temperature=temperature, format="json")
-            # 구조화 출력 적용
+            # 구조화 출력 적용 (Ollama JSON 모드로 스키마 준수)
             _structured_cache[cache_key] = llm.with_structured_output(
                 schema, method="json_schema",
             )
@@ -167,7 +174,8 @@ def get_structured_llm(
 
 def get_intent_llm() -> Runnable:
     """
-    의도 분류용 구조화 출력 LLM (Qwen 14B, temp=0.1).
+    의도 분류용 구조화 출력 LLM (temp=0.1).
+    Qwen 모델 사용.
 
     IntentResult Pydantic 모델을 자동 파싱한다.
     """
@@ -183,7 +191,8 @@ def get_intent_llm() -> Runnable:
 
 def get_emotion_llm() -> Runnable:
     """
-    감정 분석용 구조화 출력 LLM (Qwen 14B, temp=0.1).
+    감정 분석용 구조화 출력 LLM (temp=0.1).
+    Qwen 모델 사용.
 
     EmotionResult Pydantic 모델을 자동 파싱한다.
     """
@@ -199,7 +208,8 @@ def get_emotion_llm() -> Runnable:
 
 def get_preference_llm() -> Runnable:
     """
-    선호 추출용 구조화 출력 LLM (EXAONE 32B, temp=0.3).
+    선호 추출용 구조화 출력 LLM (temp=0.3).
+    EXAONE 모델 사용.
 
     ExtractedPreferences Pydantic 모델을 자동 파싱한다.
     """
@@ -215,7 +225,8 @@ def get_preference_llm() -> Runnable:
 
 def get_conversation_llm() -> ChatOllama:
     """
-    일반 대화용 LLM (EXAONE 32B, temp=0.5).
+    일반 대화용 LLM (temp=0.5).
+    EXAONE 모델 사용.
 
     자유 텍스트 생성 — 구조화 출력 미적용.
     """
@@ -228,7 +239,8 @@ def get_conversation_llm() -> ChatOllama:
 
 def get_question_llm() -> ChatOllama:
     """
-    후속 질문 생성용 LLM (EXAONE 32B, temp=0.5).
+    후속 질문 생성용 LLM (temp=0.5).
+    EXAONE 모델 사용.
 
     자유 텍스트 생성 — 구조화 출력 미적용.
     """
@@ -241,7 +253,8 @@ def get_question_llm() -> ChatOllama:
 
 def get_explanation_llm() -> ChatOllama:
     """
-    추천 이유 생성용 LLM (EXAONE 32B, temp=0.5).
+    추천 이유 생성용 LLM (temp=0.5).
+    EXAONE 모델 사용.
 
     자유 텍스트 생성 — 구조화 출력 미적용.
     """
@@ -254,7 +267,8 @@ def get_explanation_llm() -> ChatOllama:
 
 def get_intent_emotion_llm() -> Runnable:
     """
-    의도+감정 통합 분석용 구조화 출력 LLM (qwen3.5:35b-a3b, temp=0.1).
+    의도+감정 통합 분석용 구조화 출력 LLM (temp=0.1).
+    Qwen 모델 사용.
 
     IntentEmotionResult Pydantic 모델을 자동 파싱한다.
     기존 get_intent_llm() + get_emotion_llm() 2회 호출을 1회로 통합.
@@ -271,12 +285,13 @@ def get_intent_emotion_llm() -> Runnable:
 
 def get_vision_llm() -> ChatOllama:
     """
-    비전(이미지 분석)용 LLM (Qwen3.5 35B-A3B, temp=0.2).
+    비전(이미지 분석)용 LLM (temp=0.2).
+    Qwen 모델 사용 (비전 내장 멀티모달 모델).
 
     멀티모달 모델로 이미지 + 텍스트 입력을 받아 JSON 구조화 출력을 생성한다.
     영화 포스터/분위기 사진에서 장르/무드/시각요소를 추출하는 데 사용된다.
 
-    Note: format="json" 미사용. constrained decoding이 VLM 속도를 저하시키며,
+    Note: format="json" 미사용. guided decoding이 VLM 속도를 저하시키며,
     _parse_json_response()의 3단계 폴백(코드 블록, 직접 JSON, 중괄호 추출)으로 충분.
     """
     logger.debug("get_vision_llm_called", model=settings.VISION_MODEL)
@@ -299,8 +314,7 @@ async def guarded_ainvoke(
     """
     모델별 세마포어로 감싼 LLM ainvoke.
 
-    Ollama는 GPU 추론을 모델당 직렬 처리하므로,
-    동일 모델에 대한 동시 호출 수를 제한하여 Ollama 큐 점유를 방지한다.
+    동일 모델에 대한 동시 호출 수를 제한하여 Ollama 서버의 과부하를 방지한다.
     세마포어 획득 → ainvoke → 세마포어 반환의 안전한 흐름을 보장한다.
 
     Args:
