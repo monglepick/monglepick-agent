@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from monglepick.api.chat import chat_router
+from monglepick.api.match import match_router
 from monglepick.api.router import api_router
 from monglepick.config import settings
 from monglepick.db.clients import close_all_clients, init_all_clients
@@ -173,6 +174,10 @@ openapi_tags = [
         "description": "영화 추천 채팅 API. SSE 스트리밍, 동기 JSON, 이미지 업로드 3가지 방식을 지원한다.",
     },
     {
+        "name": "match",
+        "description": "Movie Match API. 두 영화 교집합 기반 함께 볼 영화 추천. SSE 스트리밍 및 동기 JSON 지원.",
+    },
+    {
         "name": "system",
         "description": "서버 상태 확인용 시스템 엔드포인트.",
     },
@@ -228,6 +233,7 @@ app.add_middleware(
 # API 라우터 등록
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
+app.include_router(match_router, prefix="/api/v1")
 
 
 @app.get(

@@ -192,13 +192,15 @@ def mock_ollama():
     with patch("monglepick.llm.factory.ChatOllama", return_value=controller._mock_instance):
         # LLM 캐시 초기화 (테스트 간 격리)
         import monglepick.llm.factory as factory_module
-        factory_module._llm_cache.clear()
+        factory_module._ollama_cache.clear()
+        factory_module._solar_cache.clear()
         factory_module._structured_cache.clear()
 
         yield controller
 
         # 테스트 후 캐시 정리
-        factory_module._llm_cache.clear()
+        factory_module._ollama_cache.clear()
+        factory_module._solar_cache.clear()
         factory_module._structured_cache.clear()
 
 

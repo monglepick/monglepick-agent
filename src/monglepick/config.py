@@ -65,9 +65,33 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Upstage/solar-embedding-1-large"
     EMBEDDING_DIMENSION: int = 4096
 
+    # ── LLM 라우팅 모드 ──
+    # "hybrid": 몽글이(로컬, 빠른 응답) + Solar API(품질 중요) 혼합
+    # "local_only": 모든 체인을 Ollama 로컬 모델로 처리 (기존 EXAONE/Qwen 또는 몽글이)
+    # "api_only": 모든 체인을 Solar API로 처리 (Ollama 장애 시)
+    LLM_MODE: str = "local_only"
+
+    # ── Solar API (Upstage, 추론 품질이 중요한 체인) ──
+    # OpenAI 호환 API — langchain-openai의 ChatOpenAI로 연동
+    # hybrid/api_only 모드에서 의도분류, 감정분석, 선호추출, 추천이유, 이미지분석에 사용
+    # UPSTAGE_API_KEY는 상단 API Keys 섹션에서 설정
+    SOLAR_API_BASE_URL: str = "https://api.upstage.ai/v1/chat"
+    SOLAR_API_MODEL: str = "solar-pro"
+    SOLAR_API_TIMEOUT: int = 30
+    SOLAR_API_MAX_RETRIES: int = 2
+    # Solar API 분당 최대 호출 수 (rate limit 보호용 세마포어)
+    SOLAR_API_RATE_LIMIT: int = 60
+
+    # ── 몽글이 (EXAONE 4.0 1.2B LoRA, Ollama 로컬, 텍스트 생성 전용) ──
+    # hybrid 모드에서 일반대화/후속질문에 사용 (분석/추론 없이 "말하기"만 담당)
+    # 파인튜닝 전에는 EXAONE 4.0 1.2B 베이스 모델 사용 가능
+    MONGLE_MODEL: str = "mongle"
+    MONGLE_TEMPERATURE: float = 0.5
+
     # ── LLM Models (Ollama 로컬 모델) ──
+    # local_only 모드에서 사용되는 Ollama 모델명
+    # hybrid 모드에서는 CONVERSATION_MODEL/QUESTION_MODEL만 로컬 사용 (나머지는 Solar API)
     # 모델명은 ollama pull/run 시 사용하는 이름과 일치해야 한다.
-    # 예: ollama pull qwen3.5:35b-a3b, ollama pull exaone-32b:latest
     #
     # 구조화 출력 (JSON) + 비전: Qwen3.5 35B-A3B (텍스트 분류 + 이미지 분석 통합)
     INTENT_MODEL: str = "qwen3.5:35b-a3b"
@@ -179,10 +203,12 @@ class Settings(BaseSettings):
             _config_logger.warning("NEO4J_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
         if not self.MYSQL_PASSWORD:
             _config_logger.warning("MYSQL_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
-        # Upstage Solar 임베딩 API 키는 RAG 검색에 필수 — 미설정 시 임베딩 호출 실패
+        # Upstage Solar API 키는 임베딩 + LLM API 모두에 필수
+        # hybrid/api_only 모드에서 미설정 시 Solar API 호출 실패
         if not self.UPSTAGE_API_KEY:
             _config_logger.warning(
-                "UPSTAGE_API_KEY가 설정되지 않았습니다. 임베딩 검색이 실패합니다. .env 파일을 확인하세요."
+                "UPSTAGE_API_KEY가 설정되지 않았습니다. "
+                "임베딩 검색 및 Solar API LLM 호출이 실패합니다. .env 파일을 확인하세요."
             )
         return self
 

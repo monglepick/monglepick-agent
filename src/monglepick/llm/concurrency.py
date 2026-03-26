@@ -1,8 +1,9 @@
 """
-모델별 동시성 제어 모듈.
+모델별 동시성 제어 모듈 — Ollama + Solar API 지원.
 
-Ollama는 OLLAMA_MAX_LOADED_MODELS로 복수 모델을 동시 로드하지만,
-GPU 메모리 한계를 고려하여 동시 호출 수를 세마포어로 제한한다.
+Ollama 로컬 모델과 Solar API 모두에 대해 동시 호출 수를 세마포어로 제한한다.
+- Ollama: GPU 메모리 한계 보호 (모델별 세마포어)
+- Solar API: rate limit 보호 ("solar_api" 키로 세마포어 관리)
 
 모델명을 키로 asyncio.Semaphore를 관리하며,
 acquire 시 대기 시간을 측정하여 structlog로 로깅한다.
@@ -10,11 +11,11 @@ acquire 시 대기 시간을 측정하여 structlog로 로깅한다.
 사용법:
     from monglepick.llm.concurrency import acquire_model_slot, release_model_slot
 
-    await acquire_model_slot("exaone-32b:latest", request_id="req-123")
-    try:
-        result = await llm.ainvoke(prompt)
-    finally:
-        release_model_slot("exaone-32b:latest")
+    # Ollama 로컬 모델
+    await acquire_model_slot("mongle", request_id="req-123")
+
+    # Solar API (rate limit 보호)
+    await acquire_model_slot("solar_api", request_id="req-456")
 """
 
 from __future__ import annotations
@@ -39,23 +40,29 @@ def _get_semaphore(model: str) -> asyncio.Semaphore:
     """
     모델명에 해당하는 세마포어를 반환한다 (없으면 생성).
 
-    LLM_PER_MODEL_CONCURRENCY 설정값으로 세마포어를 초기화한다.
+    - Ollama 모델: LLM_PER_MODEL_CONCURRENCY 설정값 사용
+    - Solar API ("solar_api" 키): SOLAR_API_RATE_LIMIT의 50%를 동시 호출 상한으로 사용
+
     동일 모델명에 대해 항상 같은 세마포어 인스턴스를 반환한다.
 
     Args:
-        model: Ollama 모델명 (예: "exaone-32b:latest", "qwen3.5:35b-a3b")
+        model: 모델명 (Ollama: "mongle", Solar API: "solar_api")
 
     Returns:
         해당 모델의 asyncio.Semaphore 인스턴스
     """
     if model not in _model_semaphores:
-        _model_semaphores[model] = asyncio.Semaphore(
-            settings.LLM_PER_MODEL_CONCURRENCY,
-        )
+        # Solar API는 rate limit 기반 세마포어 (RPM의 50% 안전 마진)
+        if model == "solar_api":
+            concurrency = max(1, settings.SOLAR_API_RATE_LIMIT // 2)
+        else:
+            concurrency = settings.LLM_PER_MODEL_CONCURRENCY
+
+        _model_semaphores[model] = asyncio.Semaphore(concurrency)
         logger.info(
             "model_semaphore_created",
             model=model,
-            concurrency_limit=settings.LLM_PER_MODEL_CONCURRENCY,
+            concurrency_limit=concurrency,
         )
     return _model_semaphores[model]
 
