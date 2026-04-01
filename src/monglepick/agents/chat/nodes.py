@@ -907,6 +907,23 @@ def _search_result_to_candidate(result: SearchResult, rank: int) -> CandidateMov
         CandidateMovie 인스턴스
     """
     meta = result.metadata or {}
+
+    # runtime: int 변환 — None 이면 None 유지 (후처리 필터에서 None은 통과 처리)
+    raw_runtime = meta.get("runtime")
+    runtime_val: int | None = int(raw_runtime) if raw_runtime is not None else None
+
+    # popularity_score: float 변환 — None 이면 None 유지
+    raw_popularity = meta.get("popularity_score")
+    popularity_val: float | None = float(raw_popularity) if raw_popularity is not None else None
+
+    # vote_count: int 변환 — None 이면 None 유지
+    raw_vote_count = meta.get("vote_count")
+    vote_count_val: int | None = int(raw_vote_count) if raw_vote_count is not None else None
+
+    # backdrop_path: 빈 문자열보다 None이 명시적이므로 빈 문자열은 None으로 정규화
+    raw_backdrop = meta.get("backdrop_path", "")
+    backdrop_val: str | None = raw_backdrop if raw_backdrop else None
+
     return CandidateMovie(
         id=result.movie_id,
         title=result.title or meta.get("title", ""),
@@ -924,6 +941,11 @@ def _search_result_to_candidate(result: SearchResult, rank: int) -> CandidateMov
         trailer_url=meta.get("trailer_url", ""),
         rrf_score=result.score,
         retrieval_source=result.source,
+        # ── 확장 메타데이터 필드 (설계서 기준 추가, 필터링·UI 렌더링용) ──
+        runtime=runtime_val,
+        popularity_score=popularity_val,
+        vote_count=vote_count_val,
+        backdrop_path=backdrop_val,
     )
 
 
@@ -957,9 +979,12 @@ async def rag_retriever(state: ChatAgentState) -> dict:
         year_range = filters.get("year_range")
 
         # ── 동적 필터 파라미터 추출 (Intent-First) ──
-        min_rating = filters.get("min_rating")       # float | None
-        has_trailer = filters.get("has_trailer")      # bool | None
-        director_name = filters.get("director")       # str | None (동적 필터에서 추출)
+        min_rating = filters.get("min_rating")           # float | None
+        has_trailer = filters.get("has_trailer")          # bool | None
+        director_name = filters.get("director")           # str | None (동적 필터에서 추출)
+        min_popularity = filters.get("min_popularity")    # float | None — TMDB 인기도 최소값
+        max_runtime = filters.get("max_runtime")          # int | None — 최대 상영시간(분)
+        min_vote_count = filters.get("min_vote_count")    # int | None — 최소 투표수
 
         # 선호에서 참조영화 ID 추출 (Neo4j 검색용)
         preferences = state.get("preferences")
@@ -969,7 +994,7 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             if ref_info:
                 similar_movie_id = ref_info
 
-        # 하이브리드 검색 실행 — 동적 필터(min_rating, has_trailer)도 전달
+        # 하이브리드 검색 실행 — 동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 전달
         results = await hybrid_search(
             query=search_query.semantic_query or search_query.keyword_query,
             top_k=search_query.limit,
@@ -982,6 +1007,9 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             similar_to_movie_id=similar_movie_id,
             exclude_ids=search_query.exclude_ids,
             has_trailer=has_trailer,
+            min_popularity=min_popularity,
+            max_runtime=max_runtime,
+            min_vote_count=min_vote_count,
         )
 
         # SearchResult → CandidateMovie 변환
@@ -1012,12 +1040,18 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             if len(filtered) >= 2:
                 candidates = filtered
 
-        # max_runtime 후처리
-        max_runtime = filters.get("max_runtime")
+        # max_runtime 후처리: CandidateMovie.runtime 필드로 상영시간 조건 2차 검증
+        # hybrid_search 내부(Qdrant/ES)에서 이미 필터를 적용했지만,
+        # Neo4j 결과에는 runtime 필터가 적용되지 않으므로 후처리로 보완한다.
+        # runtime이 None인 영화는 데이터 누락으로 간주하여 제외하지 않는다 (false negative 방지).
         if max_runtime is not None and candidates:
-            # CandidateMovie에 runtime 필드가 없으므로 메타데이터에서 확인
-            # (현재 모델에는 runtime이 없지만 향후 추가 대비)
-            pass
+            filtered = [
+                c for c in candidates
+                if c.runtime is None or c.runtime <= max_runtime
+            ]
+            # 필터 후 후보가 2편 이상이면 적용, 미만이면 필터 완화 (추천 실패 방지)
+            if len(filtered) >= 2:
+                candidates = filtered
 
         if pre_filter_count != len(candidates):
             logger.info(
@@ -1345,6 +1379,12 @@ async def recommendation_ranker(state: ChatAgentState) -> dict:
                     similar_to=[],
                 ),
                 explanation="",
+                # ── 확장 메타데이터 필드 CandidateMovie → RankedMovie 복사 ──
+                # SSE movie_card 이벤트로 프론트엔드에 전달되므로 반드시 복사해야 한다.
+                runtime=c.runtime,
+                popularity_score=c.popularity_score,
+                vote_count=c.vote_count,
+                backdrop_path=c.backdrop_path,
             ))
         return {"ranked_movies": ranked}
 

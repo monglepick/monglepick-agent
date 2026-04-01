@@ -475,6 +475,23 @@ class CandidateMovie(BaseModel):
         default="hybrid",
         description="검색 소스 (qdrant/es/neo4j/hybrid)",
     )
+    # ── 추가 메타데이터 필드 (설계서 기준 확장, 필터링·UI 렌더링 용도) ──
+    runtime: int | None = Field(
+        default=None,
+        description="상영시간 (분) — max_runtime 후처리 필터 및 프론트엔드 표시용",
+    )
+    popularity_score: float | None = Field(
+        default=None,
+        description="TMDB 인기도 점수 — min_popularity 필터 및 랭킹 보조용",
+    )
+    vote_count: int | None = Field(
+        default=None,
+        description="평점 참여 수 — min_vote_count 필터 및 신뢰도 판단용",
+    )
+    backdrop_path: str | None = Field(
+        default=None,
+        description="배경 이미지 경로 — 프론트엔드 배너/상세 화면 표시용",
+    )
 
 
 # ============================================================
@@ -532,6 +549,23 @@ class RankedMovie(BaseModel):
         description="추천 점수 분해 상세 정보",
     )
     explanation: str = Field(default="", description="추천 이유 텍스트 (explanation_generator 생성)")
+    # ── 추가 메타데이터 필드 (CandidateMovie와 동기화, SSE movie_card 이벤트로 프론트엔드 전달) ──
+    runtime: int | None = Field(
+        default=None,
+        description="상영시간 (분) — 프론트엔드 영화 카드에서 '2시간 3분' 등으로 표시",
+    )
+    popularity_score: float | None = Field(
+        default=None,
+        description="TMDB 인기도 점수 — 추천 점수 보조 참고값으로 프론트엔드 전달",
+    )
+    vote_count: int | None = Field(
+        default=None,
+        description="평점 참여 수 — 평점 신뢰도 표시용 (예: '평점 8.2 (1.2만 명 참여)')",
+    )
+    backdrop_path: str | None = Field(
+        default=None,
+        description="배경 이미지 경로 — 영화 상세/추천 카드 배너 이미지 표시용",
+    )
 
 
 # ============================================================
