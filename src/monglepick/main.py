@@ -219,7 +219,7 @@ app = FastAPI(
         "- **하이브리드 검색**: Qdrant(벡터) + Elasticsearch(BM25) + Neo4j(그래프) RRF 합산\n"
         "- **추천 엔진**: CF + CBF 하이브리드, Cold Start 처리, MMR 다양성 재정렬\n\n"
         "### 데이터 규모\n"
-        "- 영화 157,194편 (TMDB + Kaggle + KOBIS + KMDb)\n"
+        "- 영화 910,140편 (TMDB + Kaggle + KOBIS + KMDb)\n"
         "- 시청 이력 26M건, 유저 270K명\n\n"
         "### 기술 스택\n"
         "LangGraph · Ollama (EXAONE 4.0 / Qwen 3.5) · Upstage Solar 임베딩 · "

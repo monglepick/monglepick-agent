@@ -54,12 +54,15 @@ async def search_qdrant(
     min_rating: float | None = None,
     year_range: tuple[int, int] | None = None,
     has_trailer: bool | None = None,
+    min_popularity: float | None = None,
+    max_runtime: int | None = None,
+    min_vote_count: int | None = None,
 ) -> list[SearchResult]:
     """
     Qdrant 벡터 검색: 쿼리의 의미적 유사도로 영화를 검색한다.
 
     §11-1 ①: 쿼리 벡터 생성 → 코사인 유사도 Top-30 + 메타데이터 필터
-    동적 필터(min_rating, has_trailer) 지원 추가.
+    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 지원.
     """
     # Qdrant 검색 타이밍 측정 시작
     qdrant_start = time.perf_counter()
@@ -97,6 +100,24 @@ async def search_qdrant(
         from qdrant_client.models import MatchExcept
         conditions.append(FieldCondition(key="trailer_url", match=MatchExcept(except_=["", "null"])))
 
+    # 인기도 최소값 필터: popularity_score >= min_popularity 인 영화만 검색
+    # TMDB popularity_score 범위는 0~수천으로 값이 크므로 range 조건으로 처리
+    if min_popularity is not None:
+        from qdrant_client.models import Range
+        conditions.append(FieldCondition(key="popularity_score", range=Range(gte=min_popularity)))
+
+    # 최대 상영시간 필터: runtime <= max_runtime (분) 인 영화만 검색
+    # "2시간 이내" 등 사용자 요청을 동적 필터로 추출한 경우에 적용
+    if max_runtime is not None:
+        from qdrant_client.models import Range
+        conditions.append(FieldCondition(key="runtime", range=Range(lte=max_runtime)))
+
+    # 최소 투표수 필터: vote_count >= min_vote_count 인 영화만 검색
+    # 평점이 높더라도 투표 수가 너무 적으면 신뢰도가 낮으므로 필터링
+    if min_vote_count is not None:
+        from qdrant_client.models import Range
+        conditions.append(FieldCondition(key="vote_count", range=Range(gte=min_vote_count)))
+
     query_filter = Filter(must=conditions) if conditions else None
 
     logger.info(
@@ -108,6 +129,9 @@ async def search_qdrant(
         mood_filter=mood_filter,
         ott_filter=ott_filter,
         year_range=year_range,
+        min_popularity=min_popularity,
+        max_runtime=max_runtime,
+        min_vote_count=min_vote_count,
     )
 
     # 벡터 검색 실행 (qdrant-client v1.17+: search → query_points)
@@ -159,12 +183,15 @@ async def search_elasticsearch(
     mood_filter: list[str] | None = None,
     min_rating: float | None = None,
     has_trailer: bool | None = None,
+    min_popularity: float | None = None,
+    max_runtime: int | None = None,
+    min_vote_count: int | None = None,
 ) -> list[SearchResult]:
     """
     Elasticsearch BM25 검색: Nori 한국어 형태소 분석 기반 키워드 매칭.
 
     §11-1 ②: multi_match + function_score (무드태그 부스트)
-    동적 필터(min_rating, has_trailer) 지원 추가.
+    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 지원.
     """
     # ES 검색 타이밍 측정 시작
     es_start = time.perf_counter()
@@ -200,6 +227,21 @@ async def search_elasticsearch(
         # 빈 문자열 제외 (exists만으로는 ""도 포함되므로)
         filter_clauses.append({"bool": {"must_not": [{"term": {"trailer_url.keyword": ""}}]}})
 
+    # 동적 필터: 인기도 최소값 (popularity_score >= min_popularity)
+    # TMDB popularity_score 기반, 예: "인기 있는 영화" → min_popularity=10.0
+    if min_popularity is not None:
+        filter_clauses.append({"range": {"popularity_score": {"gte": min_popularity}}})
+
+    # 동적 필터: 최대 상영시간 (runtime <= max_runtime, 단위: 분)
+    # 예: "2시간 이내" → max_runtime=120, "짧은 영화" → max_runtime=90
+    if max_runtime is not None:
+        filter_clauses.append({"range": {"runtime": {"lte": max_runtime}}})
+
+    # 동적 필터: 최소 투표수 (vote_count >= min_vote_count)
+    # 평점의 신뢰도 보장: 투표 수가 너무 적은 영화를 검색 결과에서 제외
+    if min_vote_count is not None:
+        filter_clauses.append({"range": {"vote_count": {"gte": min_vote_count}}})
+
     # function_score로 인기도 부스트
     body = {
         "query": {
@@ -231,6 +273,9 @@ async def search_elasticsearch(
         top_k=top_k,
         genre_filter=genre_filter,
         mood_filter=mood_filter,
+        min_popularity=min_popularity,
+        max_runtime=max_runtime,
+        min_vote_count=min_vote_count,
     )
 
     resp = await client.search(index=ES_INDEX_NAME, body=body)
@@ -524,16 +569,20 @@ async def hybrid_search(
     similar_to_movie_id: str | None = None,
     exclude_ids: list[str] | None = None,
     has_trailer: bool | None = None,
+    min_popularity: float | None = None,
+    max_runtime: int | None = None,
+    min_vote_count: int | None = None,
 ) -> list[SearchResult]:
     """
     3개 검색 엔진을 동시 실행하고 RRF로 합산하여 최종 후보를 반환한다.
 
     §11-1 하이브리드 검색 흐름:
-    ① Qdrant 벡터 검색 (의미) — min_rating, has_trailer 필터 지원
-    ② ES BM25 검색 (키워드) — min_rating, has_trailer 필터 지원
+    ① Qdrant 벡터 검색 (의미) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count 필터 지원
+    ② ES BM25 검색 (키워드) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count 필터 지원
     ③ Neo4j 그래프 검색 (관계)
     ④ 시청 완료 영화 제외 (RRF 전)
     ⑤ RRF 합산 → 최종 후보
+    ⑥ max_runtime 후처리 필터 (메타데이터 기반 2차 검증)
 
     Args:
         query: 사용자 검색 쿼리
@@ -547,6 +596,9 @@ async def hybrid_search(
         similar_to_movie_id: 유사 영화 기준 ID (Neo4j SIMILAR_TO)
         exclude_ids: 제외할 영화 ID 목록
         has_trailer: 트레일러 존재 여부 필터 (동적 필터)
+        min_popularity: 인기도 최소값 필터 (TMDB popularity_score 기준)
+        max_runtime: 최대 상영시간(분) 필터 — DB 필터 + RRF 후 후처리 2중 적용
+        min_vote_count: 최소 투표수 필터 (평점 신뢰도 보장)
 
     Returns:
         RRF 합산 점수 기준 상위 top_k 결과
@@ -577,6 +629,9 @@ async def hybrid_search(
                     min_rating=min_rating,
                     year_range=year_range,
                     has_trailer=has_trailer,
+                    min_popularity=min_popularity,
+                    max_runtime=max_runtime,
+                    min_vote_count=min_vote_count,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -598,6 +653,9 @@ async def hybrid_search(
                     mood_filter=mood_tags,
                     min_rating=min_rating,
                     has_trailer=has_trailer,
+                    min_popularity=min_popularity,
+                    max_runtime=max_runtime,
+                    min_vote_count=min_vote_count,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -671,6 +729,26 @@ async def hybrid_search(
         [qdrant_results, es_results, neo4j_results],
         k=RRF_K,
     )
+
+    # ── max_runtime 후처리 필터 (§11-1 ⑥) ──
+    # DB 레벨 필터(Qdrant/ES)에서 누락될 수 있는 케이스를 RRF 합산 후 2차로 검증한다.
+    # Neo4j 결과는 runtime 필터를 지원하지 않으므로 반드시 후처리가 필요하다.
+    # 메타데이터에 runtime이 없는 영화(None)는 필터링하지 않는다 — 데이터 누락으로 제외하면
+    # 실제로는 조건을 만족할 수 있는 영화가 탈락하는 false negative가 발생하기 때문이다.
+    if max_runtime is not None and fused:
+        before_count = len(fused)
+        fused = [
+            r for r in fused
+            if r.metadata.get("runtime") is None
+            or r.metadata.get("runtime", 0) <= max_runtime
+        ]
+        if before_count != len(fused):
+            logger.info(
+                "max_runtime_post_filter_applied",
+                max_runtime=max_runtime,
+                before=before_count,
+                after=len(fused),
+            )
 
     final = fused[:top_k]
 

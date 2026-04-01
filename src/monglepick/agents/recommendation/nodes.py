@@ -873,6 +873,12 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
                 rank=rank_idx + 1,
                 score_detail=score_detail,
                 explanation="",  # explanation_generator가 채울 예정
+                # ── 확장 메타데이터 필드 CandidateMovie → RankedMovie 복사 ──
+                # SSE movie_card 이벤트를 통해 프론트엔드로 전달되므로 반드시 복사해야 한다.
+                runtime=movie.runtime,
+                popularity_score=movie.popularity_score,
+                vote_count=movie.vote_count,
+                backdrop_path=movie.backdrop_path,
             )
             ranked_movies.append(ranked_movie)
 
@@ -924,6 +930,11 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
                 rank=i + 1,
                 score_detail=ScoreDetail(hybrid_score=c.rrf_score),
                 explanation="",
+                # ── 확장 메타데이터 필드 CandidateMovie → RankedMovie 복사 (fallback 경로) ──
+                runtime=c.runtime,
+                popularity_score=c.popularity_score,
+                vote_count=c.vote_count,
+                backdrop_path=c.backdrop_path,
             )
             for i, c in enumerate(candidates[:TOP_K])
         ]
