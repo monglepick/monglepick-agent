@@ -79,6 +79,12 @@ def _format_candidate_for_rerank(movie: CandidateMovie, idx: int) -> str:
     else:
         parts.append("트레일러: 없음")
 
+    # ── 국가/언어 정보 (한국영화 등 국가 기반 추천 시 LLM이 판단할 수 있도록 포함) ──
+    if movie.original_language:
+        parts.append(f"언어: {movie.original_language}")
+    if movie.origin_country:
+        parts.append(f"국가: {', '.join(movie.origin_country)}")
+
     # 줄거리는 150자로 제한 (토큰 절약)
     if movie.overview:
         overview = movie.overview[:150]

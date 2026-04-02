@@ -218,6 +218,10 @@ FILTERABLE_FIELDS: dict[str, dict[str, str]] = {
     "trailer_url": {"type": "str", "description": "트레일러/예고편 URL (exists로 유무 확인)"},
     "popularity_score": {"type": "float", "description": "인기도 점수"},
     "vote_count": {"type": "int", "description": "투표/평가 수"},
+    # ── 국가/언어 필터 (한국영화, 일본 애니 등 국가 기반 추천 지원) ──
+    "origin_country": {"type": "list[str]", "description": "창작 원산국 ISO 3166-1 코드 (예: KR, US, JP)"},
+    "original_language": {"type": "str", "description": "원본 언어 ISO 639-1 소문자 코드 (예: ko, en, ja) — 반드시 소문자"},
+    "production_countries": {"type": "list[str]", "description": "제작 국가 ISO 3166-1 코드 (예: KR, US)"},
 }
 
 
@@ -492,6 +496,15 @@ class CandidateMovie(BaseModel):
         default=None,
         description="배경 이미지 경로 — 프론트엔드 배너/상세 화면 표시용",
     )
+    # ── 국가/언어 필드 (한국영화 필터링 및 재랭킹 시 국가 판별용) ──
+    original_language: str = Field(
+        default="",
+        description="원본 언어 ISO 639-1 코드 (예: ko, en, ja)",
+    )
+    origin_country: list[str] = Field(
+        default_factory=list,
+        description="창작 원산국 ISO 3166-1 코드 목록 (예: ['KR'])",
+    )
 
 
 # ============================================================
@@ -628,6 +641,12 @@ class ChatAgentState(TypedDict, total=False):
     retrieval_quality_passed: bool  # 검색 품질 통과 여부
     retrieval_feedback: str  # 품질 미달 시 피드백 메시지
 
+    # ── Phase 3: 암시적 평점 (user_implicit_rating 테이블) ──
+    implicit_ratings: dict[str, float]  # {movie_id: implicit_score} — CF fallback에 활용
+
+    # ── Phase 4: 행동 프로필 (user_behavior_profile 테이블) ──
+    user_behavior_profile: dict[str, Any]  # taste_consistency, genre_affinity 등
+
     # ── error_handler ──
     error: str | None
 
@@ -725,11 +744,26 @@ def is_sufficient(
     Returns:
         True면 추천 진행, False면 후속 질문 필요
     """
-    # 1) user_intent가 있으면 → 충분 (사용자가 원하는 것을 LLM이 이해함)
-    if prefs.user_intent:
+    # Phase ML-3: user_intent만으로는 즉시 충분 판정하지 않는다.
+    # "영화 추천해줘" 같은 모호한 요청에서도 user_intent가 채워지지만,
+    # 구체적 선호 정보(장르/무드/참조영화/필터)가 하나도 없으면 재질문이 더 좋은 UX.
+
+    # 구체적 선호 정보가 하나라도 있는지 확인
+    has_specific_pref = bool(
+        prefs.genre_preference
+        or prefs.mood
+        or prefs.reference_movies
+        or prefs.dynamic_filters
+        or prefs.search_keywords
+    )
+
+    # 1) user_intent + 구체적 선호 정보 → 충분
+    #    "액션 영화 추천해줘" → intent + genre="액션" → 충분
+    #    "영화 추천해줘" → intent + (없음) → 부족 → 재질문
+    if prefs.user_intent and has_specific_pref:
         return True
 
-    # 2) dynamic_filters가 있으면 → 충분 (구체적 ��터 조건 존재)
+    # 2) dynamic_filters만으로도 충분 (구체적 필터 조건 존재)
     if prefs.dynamic_filters:
         return True
 
@@ -737,12 +771,41 @@ def is_sufficient(
     if prefs.genre_preference or prefs.mood or prefs.reference_movies:
         return True
 
-    # 4) 턴 카운트 오버라이드
+    # 4) 감정 감지 + user_intent → 충분
+    #    "우울한데 영화 추천해줘" → emotion=sad + intent → 충분
+    if prefs.user_intent and has_emotion:
+        return True
+
+    # 5) 턴 카운트 오버라이드 (강제 추천)
     if turn_count >= TURN_COUNT_OVERRIDE:
         return True
 
-    # 5) 기존 가중치 합산 fallback
+    # 6) 기존 가중치 합산 fallback
     return calculate_sufficiency(prefs, has_emotion, has_image_analysis) >= SUFFICIENCY_THRESHOLD
+
+
+def _merge_comma_field(prev_val: str | None, curr_val: str | None) -> str | None:
+    """
+    쉼표로 구분된 문자열 필드를 합집합으로 병합한다.
+
+    Phase ML-3: genre_preference, mood 등의 필드를 덮어쓰기 대신 누적한다.
+    - 이전: "액션" + 현재: "코미디" → "액션, 코미디"
+    - 이전: "액션, SF" + 현재: "액션" → "액션, SF" (중복 제거)
+    - 이전: "액션" + 현재: None → "액션" (이전 유지)
+    - 이전: None + 현재: "코미디" → "코미디"
+    """
+    if not prev_val and not curr_val:
+        return None
+    if not prev_val:
+        return curr_val
+    if not curr_val:
+        return prev_val
+
+    # 쉼표/공백으로 분리 후 합집합 (순서 유지, 중복 제거)
+    prev_items = [item.strip() for item in prev_val.split(",") if item.strip()]
+    curr_items = [item.strip() for item in curr_val.split(",") if item.strip()]
+    merged = list(dict.fromkeys(prev_items + curr_items))
+    return ", ".join(merged) if merged else None
 
 
 def merge_preferences(
@@ -753,8 +816,9 @@ def merge_preferences(
     이전 선호 조건과 현재 추출된 선호 조건을 병합한다.
 
     병합 규칙:
-    - 새 값이 None/빈값이 아니면 덮어쓰기
-    - 새 값이 None/빈값이면 이전 값 유지
+    - genre_preference: 합집합 (Phase ML-3, "액션" + "코미디" = "액션, 코미디")
+    - mood: 합집합 (Phase ML-3, "웅장" + "잔잔" = "웅장, 잔잔")
+    - 기타 단일값 필드: 새 값이 있으면 덮어쓰기, 없으면 이전 유지
     - reference_movies: 합집합 (중복 제거)
     - dynamic_filters: 현재 턴 필터 우선, 이전 필터 중 다른 필드의 것만 추가
     - search_keywords: 합집합 (중복 제거)
@@ -782,9 +846,15 @@ def merge_preferences(
         prev.search_keywords + curr.search_keywords
     ))
 
+    # ── Phase ML-3: genre_preference/mood 합집합 누적 ──
+    # 기존: 덮어쓰기 → 이전 턴 장르/무드 유실
+    # 개선: 합집합 → 턴1 "액션" + 턴2 "코미디도" = "액션, 코미디"
+    merged_genre = _merge_comma_field(prev.genre_preference, curr.genre_preference)
+    merged_mood = _merge_comma_field(prev.mood, curr.mood)
+
     return ExtractedPreferences(
-        genre_preference=curr.genre_preference if curr.genre_preference is not None else prev.genre_preference,
-        mood=curr.mood if curr.mood is not None else prev.mood,
+        genre_preference=merged_genre,
+        mood=merged_mood,
         viewing_context=curr.viewing_context if curr.viewing_context is not None else prev.viewing_context,
         platform=curr.platform if curr.platform is not None else prev.platform,
         # reference_movies: 합집합 (이전 + 현재, 중복 제거, 순서 유지)

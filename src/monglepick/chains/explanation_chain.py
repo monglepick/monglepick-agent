@@ -300,6 +300,8 @@ async def generate_explanation(
 async def generate_explanations_batch(
     movies: list[RankedMovie | CandidateMovie | dict],
     emotion: str | None = None,
+    user_mood_tags: list[str] | None = None,
+    user_message: str | None = None,
     preferences: ExtractedPreferences | None = None,
     watch_history_titles: list[str] | None = None,
 ) -> list[str]:
@@ -316,6 +318,8 @@ async def generate_explanations_batch(
     Args:
         movies: 추천 영화 목록 (3~5편)
         emotion: 사용자 감정
+        user_mood_tags: 사용자 무드 태그 목록 (감정 분석 결과)
+        user_message: 사용자 원문 메시지 (추천 이유 개인화에 활용)
         preferences: 사용자 선호 조건
         watch_history_titles: 시청 이력 제목 목록
 

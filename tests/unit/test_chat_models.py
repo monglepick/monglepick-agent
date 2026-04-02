@@ -141,12 +141,12 @@ class TestMergePreferences:
     """선호 조건 병합 로직 테스트."""
 
     def test_merge_new_overrides_prev(self):
-        """새 값이 non-None이면 이전 값을 덮어쓴다."""
+        """Phase ML-3: genre/mood는 합집합으로 누적된다."""
         prev = ExtractedPreferences(genre_preference="액션", mood="유쾌")
         curr = ExtractedPreferences(genre_preference="SF", mood=None)
         merged = merge_preferences(prev, curr)
-        # SF가 액션을 덮어씀
-        assert merged.genre_preference == "SF"
+        # Phase ML-3: SF가 액션에 추가됨 (합집합)
+        assert merged.genre_preference == "액션, SF"
         # mood=None이므로 이전 값 유지
         assert merged.mood == "유쾌"
 
@@ -275,9 +275,11 @@ class TestIsSufficient:
         assert is_sufficient(ExtractedPreferences(reference_movies=["인셉션"])) is True
 
     def test_turn_count_override(self):
-        """turn_count >= 2이면 선호 부족해도 충분 (TURN_COUNT_OVERRIDE=2)."""
+        """Phase ML-3: turn_count >= 3이면 선호 부족해도 충분 (TURN_COUNT_OVERRIDE=3)."""
         prefs = ExtractedPreferences()  # 0.0
-        assert is_sufficient(prefs, turn_count=2) is True
+        # turn_count=2 → 아직 부족 (Phase ML-3: 2→3 상향)
+        assert is_sufficient(prefs, turn_count=2) is False
+        assert is_sufficient(prefs, turn_count=3) is True
         assert is_sufficient(prefs, turn_count=5) is True
 
     def test_turn_count_below_threshold(self):

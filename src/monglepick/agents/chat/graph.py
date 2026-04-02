@@ -184,8 +184,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.015)
     3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.01)
 
-    품질 미달 + turn_count < TURN_COUNT_OVERRIDE(2) → question_generator (추가 질문)
-    품질 미달 + turn_count ≥ TURN_COUNT_OVERRIDE(2) → recommendation_ranker (있는 결과로 진행)
+    품질 미달 + turn_count < TURN_COUNT_OVERRIDE(3) → question_generator (추가 질문)
+    품질 미달 + turn_count ≥ TURN_COUNT_OVERRIDE(3) → recommendation_ranker (있는 결과로 진행)
     품질 충족 → recommendation_ranker
 
     Args:
@@ -221,7 +221,7 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     )
 
     if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
-        # 품질 통과 또는 TURN_COUNT_OVERRIDE(2)턴 이상이면 LLM 재랭킹 → 추천 진행
+        # 품질 통과 또는 TURN_COUNT_OVERRIDE(3)턴 이상이면 LLM 재랭킹 → 추천 진행
         return "llm_reranker"
     else:
         # 품질 미달: state에 피드백 메시지 설정 (question_generator에서 활용)
@@ -504,8 +504,8 @@ async def run_chat_agent(
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    # 2. Redis에서 기존 세션 로드
-    session_data = await load_session(session_id)
+    # 2. MySQL에서 기존 세션 로드 (Backend API 경유)
+    session_data = await load_session(user_id, session_id)
 
     # 3. 초기 State 구성 (세션 데이터 병합)
     initial_state: ChatAgentState = {
@@ -704,9 +704,9 @@ async def run_chat_agent(
                             movie_data = movie.model_dump() if hasattr(movie, "model_dump") else movie
                             yield _format_sse_event("movie_card", movie_data)
 
-        # 5. 그래프 완료 후 세션 저장
+        # 5. 그래프 완료 후 세션 저장 (Backend API → MySQL)
         merged_state = {**initial_state, **final_state}
-        await save_session(session_id, merged_state)
+        await save_session(user_id, session_id, merged_state)
 
         # 완료 이벤트
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
@@ -781,8 +781,8 @@ async def run_chat_agent_sync(
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    # 2. Redis에서 기존 세션 로드
-    session_data = await load_session(session_id)
+    # 2. MySQL에서 기존 세션 로드 (Backend API 경유)
+    session_data = await load_session(user_id, session_id)
 
     # 3. 초기 State 구성 (세션 데이터 병합)
     initial_state: ChatAgentState = {
@@ -811,8 +811,8 @@ async def run_chat_agent_sync(
 
     result = await chat_graph.ainvoke(initial_state)
 
-    # 4. 그래프 완료 후 세션 저장
-    await save_session(session_id, result)
+    # 4. 그래프 완료 후 세션 저장 (Backend API → MySQL)
+    await save_session(user_id, session_id, result)
 
     graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
     logger.info(

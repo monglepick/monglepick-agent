@@ -202,7 +202,10 @@ class Settings(BaseSettings):
     # 선호 충분성 판정 임계값 (가중치 합산이 이 값 이상이면 추천 진행)
     SUFFICIENCY_THRESHOLD: float = 2.5
     # 턴 카운트 오버라이드 (이 턴 이상이면 선호 부족해도 추천 진행)
-    TURN_COUNT_OVERRIDE: int = 2
+    # Phase ML-3: 2→3으로 상향하여 재질문 기회를 최대 2회 제공
+    # 기존(2): 턴1 모호 → 재질문 → 턴2 모호 → 강제 추천 (재질문 1회)
+    # 개선(3): 턴1 모호 → 재질문 → 턴2 모호 → 재질문 → 턴3 강제 추천 (재질문 2회)
+    TURN_COUNT_OVERRIDE: int = 3
 
     # ── Recommendation Engine Thresholds (추천 엔진) ──
     # Cold Start 판정: 시청 이력이 이 값 미만이면 Cold Start

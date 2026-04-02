@@ -44,6 +44,18 @@ DB에서 직접 필터링할 수 있는 조건만 추출합니다.
 | trailer_url | str | 트레일러 URL | "예고편 있는" → trailer_url exists true |
 | popularity_score | float | 인기도 | "인기 있는" → popularity_score gte 50.0 |
 | vote_count | int | 평가 수 | "많이 본" → vote_count gte 1000 |
+| origin_country | list[str] | 창작 원산국 ISO 코드 | "한국영화" → origin_country contains "KR" |
+| original_language | str | 원본 언어 ISO 코드 | "영어 영화" → original_language eq "en" |
+| production_countries | list[str] | 제작 국가 ISO 코드 | "할리우드 영화" → production_countries contains "US" |
+
+### 국가/언어 필터 추출 규칙:
+- "한국영화", "국내 영화", "한국 영화" → origin_country contains "KR"
+- "일본 애니", "일본 영화" → origin_country contains "JP"
+- "미국 영화", "할리우드" → origin_country contains "US" 또는 production_countries contains "US"
+- "프랑스 영화" → origin_country contains "FR"
+- "영어로 된 영화" → original_language eq "en"
+- "해외 영화 말고 한국꺼만" → origin_country contains "KR" (exclude에도 반영)
+- 국가/언어 조건은 **반드시 dynamic_filters로 추출**하세요 (user_intent에만 남기면 안 됩니다)
 
 ### 지원 연산자:
 - gte: 이상 (>=), lte: 이하 (<=), eq: 일치 (==)

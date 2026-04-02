@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import time
 import traceback
-import uuid
 from typing import Any
 
 import structlog
@@ -41,34 +40,9 @@ from monglepick.chains.match_explanation_chain import (
 from monglepick.config import settings
 from monglepick.db.clients import get_mysql, get_qdrant
 from monglepick.rag.hybrid_search import hybrid_search
+from monglepick.utils.qdrant_helpers import to_point_id
 
 logger = structlog.get_logger()
-
-
-# ============================================================
-# 내부 유틸 — Qdrant point ID 변환 (_to_point_id 재사용)
-# ============================================================
-
-def _to_point_id(doc_id: str) -> int | str:
-    """
-    movie_id를 Qdrant PointStruct ID로 변환한다.
-
-    data_pipeline.qdrant_loader._to_point_id() 로직을 인라인 복사하여
-    해당 모듈의 임포트 없이 동일 변환 로직을 사용한다.
-
-    - 순수 숫자 ID (TMDB/Kaggle): int() 변환
-    - 알파벳 포함 ID (KOBIS 코드 등): uuid5(NAMESPACE_URL, "kobis:{id}") 변환
-
-    Args:
-        doc_id: 영화 ID 문자열
-
-    Returns:
-        Qdrant 호환 point ID (int 또는 str UUID)
-    """
-    if doc_id.isdigit():
-        return int(doc_id)
-    # 알파벳 포함 ID → 결정적 UUID5 변환 (동일 입력 → 동일 UUID)
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"kobis:{doc_id}"))
 
 
 def _payload_to_movie_dict(payload: dict[str, Any], point_id: Any) -> dict[str, Any]:
@@ -140,8 +114,8 @@ async def movie_loader(state: MovieMatchState) -> dict:
     try:
         # ── [1] Qdrant에서 두 영화 일괄 조회 (with_vectors=True) ──
         client = await get_qdrant()
-        point_id_1 = _to_point_id(movie_id_1)
-        point_id_2 = _to_point_id(movie_id_2)
+        point_id_1 = to_point_id(movie_id_1)
+        point_id_2 = to_point_id(movie_id_2)
 
         # 두 포인트를 한 번의 API 호출로 조회 (네트워크 왕복 최소화)
         points = await client.retrieve(
@@ -230,6 +204,16 @@ async def movie_loader(state: MovieMatchState) -> dict:
                             movie_1 = mysql_map.get(movie_id_1)
                         if movie_2 is None:
                             movie_2 = mysql_map.get(movie_id_2)
+
+                        # MySQL fallback 영화는 embedding/mood/keyword 없음 → 스코어링 품질 저하 경고
+                        mysql_loaded = [mid for mid in missing_ids if mid in mysql_map]
+                        if mysql_loaded:
+                            logger.warning(
+                                "match_movie_loader_mysql_fallback_quality",
+                                mysql_loaded_ids=mysql_loaded,
+                                detail="MySQL fallback 영화는 embedding/mood_tags/keywords가 없어 "
+                                       "유사도 계산 시 가중치가 재정규화됩니다 (장르 기반으로 축소).",
+                            )
             except Exception as db_err:
                 logger.warning(
                     "match_movie_loader_mysql_error",
@@ -275,7 +259,21 @@ async def movie_loader(state: MovieMatchState) -> dict:
             stack_trace=traceback.format_exc(),
             elapsed_ms=round(elapsed_ms, 1),
         )
-        # 예외 발생 시 에러 상태 반환 → route_after_load에서 END로 분기
+        # ── 인프라 장애 vs 비즈니스 에러 구분 ──
+        # ConnectionError, TimeoutError 등 인프라 예외는 SERVICE_UNAVAILABLE로 분리하여
+        # 모니터링/알림 시스템이 MOVIE_NOT_FOUND(정상)와 구분할 수 있도록 한다.
+        # qdrant_client의 통신 에러(httpx 기반)도 인프라 장애로 분류한다.
+        infra_errors = (ConnectionError, TimeoutError, OSError)
+        error_type_name = type(e).__name__
+        infra_keywords = ("connect", "timeout", "unreachable", "refused", "reset")
+        is_infra = (
+            isinstance(e, infra_errors)
+            or any(kw in error_type_name.lower() for kw in infra_keywords)
+            or any(kw in str(e).lower() for kw in infra_keywords)
+        )
+
+        if is_infra:
+            return {"error": f"SERVICE_UNAVAILABLE:{error_type_name} - {str(e)[:100]}"}
         return {"error": f"MOVIE_NOT_FOUND:{movie_id_1},{movie_id_2}"}
 
 
@@ -614,7 +612,7 @@ async def rag_retriever(state: MovieMatchState) -> dict:
         # ── [4] Qdrant에서 임베딩 벡터 일괄 조회 ──
         # hybrid_search() 결과에는 벡터가 없으므로 별도 retrieve 호출 필요
         client = await get_qdrant()
-        point_ids = [_to_point_id(mid) for mid in candidate_ids]
+        point_ids = [to_point_id(mid) for mid in candidate_ids]
 
         try:
             points = await client.retrieve(
@@ -670,7 +668,7 @@ async def rag_retriever(state: MovieMatchState) -> dict:
             }
 
             # Qdrant 벡터 오버레이 (더 상세한 payload 포함)
-            pid = _to_point_id(mid)
+            pid = to_point_id(mid)
             if pid in vector_map:
                 payload, vec = vector_map[pid]
                 # payload에서 더 풍부한 메타데이터 보강
@@ -723,7 +721,7 @@ async def match_scorer(state: MovieMatchState) -> dict:
     4. MatchedMovie 리스트 구성
 
     MMR 공식:
-    MMR(c) = 0.7 × match_score(c) − 0.3 × max(genre_jaccard(c, s) for s in selected)
+    MMR(c) = 0.7 × match_score(c) − 0.3 × max(0.7×genre_jaccard + 0.3×mood_jaccard for s in selected)
 
     Args:
         state: MovieMatchState (candidate_movies, movie_1, movie_2, shared_features 필수)
@@ -786,11 +784,17 @@ async def match_scorer(state: MovieMatchState) -> dict:
             best_idx = 0
 
             for i, (candidate, score_detail) in enumerate(remaining):
-                # 현재까지 선택된 영화들과의 최대 장르 유사도 계산
+                # 현재까지 선택된 영화들과의 최대 유사도 계산 (장르 + 무드 가중 평균)
+                # 장르만 사용하면 감독/무드가 같아도 장르만 다르면 "다양하다"고 오판할 수 있다.
+                # 장르 70% + 무드 30% 가중 평균으로 다양성을 더 정교하게 판단한다.
                 max_sim_to_selected = max(
-                    jaccard(
+                    0.7 * jaccard(
                         set(candidate.get("genres", [])),
                         set(s.get("genres", [])),
+                    )
+                    + 0.3 * jaccard(
+                        set(candidate.get("mood_tags", [])),
+                        set(s.get("mood_tags", [])),
                     )
                     for s, _ in selected
                 ) if selected else 0.0

@@ -280,8 +280,8 @@ class TestGraphSemaphore:
         assert settings.LLM_PER_MODEL_CONCURRENCY == 2
 
     def test_max_explanation_movies_default(self):
-        """MAX_EXPLANATION_MOVIES 기본값이 3이다."""
-        assert settings.MAX_EXPLANATION_MOVIES == 3
+        """MAX_EXPLANATION_MOVIES 기본값이 5이다 (하이브리드 LLM 전환 후 상향)."""
+        assert settings.MAX_EXPLANATION_MOVIES == 5
 
     def test_graph_semaphore_exists_in_chat_module(self):
         """chat.py에 _graph_semaphore가 존재한다."""
