@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import structlog
 from langsmith import traceable
-from qdrant_client.models import FieldCondition, Filter, MatchAny
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from monglepick.config import settings
 from monglepick.data_pipeline.embedder import embed_query_async
@@ -57,12 +57,16 @@ async def search_qdrant(
     min_popularity: float | None = None,
     max_runtime: int | None = None,
     min_vote_count: int | None = None,
+    origin_country_filter: list[str] | None = None,
+    language_filter: str | None = None,
+    production_countries_filter: list[str] | None = None,
 ) -> list[SearchResult]:
     """
     Qdrant 벡터 검색: 쿼리의 의미적 유사도로 영화를 검색한다.
 
     §11-1 ①: 쿼리 벡터 생성 → 코사인 유사도 Top-30 + 메타데이터 필터
-    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 지원.
+    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count,
+    origin_country, original_language, production_countries) 지원.
     """
     # Qdrant 검색 타이밍 측정 시작
     qdrant_start = time.perf_counter()
@@ -118,6 +122,18 @@ async def search_qdrant(
         from qdrant_client.models import Range
         conditions.append(FieldCondition(key="vote_count", range=Range(gte=min_vote_count)))
 
+    # ── 국가/언어 필터 (한국영화, 일본 애니 등 국가 기반 추천) ──
+    # origin_country: payload에 list[str]로 저장됨 (예: ["KR"])
+    # MatchAny로 하나라도 일치하면 매칭 (OR 조건)
+    if origin_country_filter:
+        conditions.append(FieldCondition(key="origin_country", match=MatchAny(any=origin_country_filter)))
+    # original_language: payload에 str로 저장됨 (예: "ko")
+    if language_filter:
+        conditions.append(FieldCondition(key="original_language", match=MatchValue(value=language_filter)))
+    # production_countries: payload에 list[str]로 저장됨 (예: ["KR", "US"])
+    if production_countries_filter:
+        conditions.append(FieldCondition(key="production_countries", match=MatchAny(any=production_countries_filter)))
+
     query_filter = Filter(must=conditions) if conditions else None
 
     logger.info(
@@ -132,6 +148,9 @@ async def search_qdrant(
         min_popularity=min_popularity,
         max_runtime=max_runtime,
         min_vote_count=min_vote_count,
+        origin_country_filter=origin_country_filter,
+        language_filter=language_filter,
+        production_countries_filter=production_countries_filter,
     )
 
     # 벡터 검색 실행 (qdrant-client v1.17+: search → query_points)
@@ -186,29 +205,43 @@ async def search_elasticsearch(
     min_popularity: float | None = None,
     max_runtime: int | None = None,
     min_vote_count: int | None = None,
+    origin_country_filter: list[str] | None = None,
+    language_filter: str | None = None,
+    production_countries_filter: list[str] | None = None,
 ) -> list[SearchResult]:
     """
     Elasticsearch BM25 검색: Nori 한국어 형태소 분석 기반 키워드 매칭.
 
     §11-1 ②: multi_match + function_score (무드태그 부스트)
-    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 지원.
+    동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count,
+    origin_country, original_language, production_countries) 지원.
     """
     # ES 검색 타이밍 측정 시작
     es_start = time.perf_counter()
     client = await get_elasticsearch()
 
-    # multi_match 쿼리 (title, director, overview, cast, keywords 대상)
+    # multi_match 쿼리 (한글 + 영문 필드 동시 검색)
+    # Phase ML (다국어 검색 개선):
+    #   - title_en^2.5: 영문 제목 (standard analyzer) 추가 — 영문 메타데이터만 있는 영화 검색 지원
+    #   - overview_en^0.8: 영문 줄거리 (standard analyzer) 추가 — 한글 줄거리 없는 영화 보완
+    #   - alternative_titles^1.5: 대체 제목 (다국어) 추가 — "Frozen"→"겨울왕국" 등 역방향 검색
+    #   - tie_breaker=0.3: 여러 필드 매칭 시 최고 점수 외 나머지 필드 30% 반영
+    #     (한글 제목 + 영문 제목 동시 매칭 시 점수 합산 효과)
     must_query: dict = {
         "multi_match": {
             "query": query,
             "fields": [
                 "title^3.0",
+                "title_en^2.5",
                 "director^2.5",
                 "cast^2.0",
                 "keywords^1.5",
+                "alternative_titles^1.5",
                 "overview^1.0",
+                "overview_en^0.8",
             ],
             "type": "best_fields",
+            "tie_breaker": 0.3,
         }
     }
 
@@ -241,6 +274,17 @@ async def search_elasticsearch(
     # 평점의 신뢰도 보장: 투표 수가 너무 적은 영화를 검색 결과에서 제외
     if min_vote_count is not None:
         filter_clauses.append({"range": {"vote_count": {"gte": min_vote_count}}})
+
+    # ── 국가/언어 필터 (한국영화, 일본 애니 등 국가 기반 추천) ──
+    # origin_country: keyword 타입, 리스트 값 (예: ["KR"]) → terms 쿼리로 OR 매칭
+    if origin_country_filter:
+        filter_clauses.append({"terms": {"origin_country": origin_country_filter}})
+    # original_language: keyword 타입, 단일 값 (예: "ko") → term 쿼리로 정확 매칭
+    if language_filter:
+        filter_clauses.append({"term": {"original_language": language_filter}})
+    # production_countries: keyword 타입, 리스트 값 (예: ["KR", "US"]) → terms 쿼리로 OR 매칭
+    if production_countries_filter:
+        filter_clauses.append({"terms": {"production_countries": production_countries_filter}})
 
     # function_score로 인기도 부스트
     body = {
@@ -276,6 +320,9 @@ async def search_elasticsearch(
         min_popularity=min_popularity,
         max_runtime=max_runtime,
         min_vote_count=min_vote_count,
+        origin_country_filter=origin_country_filter,
+        language_filter=language_filter,
+        production_countries_filter=production_countries_filter,
     )
 
     resp = await client.search(index=ES_INDEX_NAME, body=body)
@@ -320,6 +367,8 @@ async def search_neo4j(
     director: str | None = None,
     similar_to_movie_id: str | None = None,
     top_k: int = 15,
+    origin_country_filter: list[str] | None = None,
+    language_filter: str | None = None,
 ) -> list[SearchResult]:
     """
     Neo4j 그래프 검색: 무드/장르/감독 관계를 기반으로 영화를 탐색한다.
@@ -342,23 +391,22 @@ async def search_neo4j(
         director=director,
         similar_to_movie_id=similar_to_movie_id,
         top_k=top_k,
+        origin_country_filter=origin_country_filter,
+        language_filter=language_filter,
     )
 
     async with driver.session() as session:
-        # 전략 1: 무드태그 + 장르 조합 검색
-        if mood_tags or genres:
-            conditions = []
+        # 전략 1: 무드태그 + 장르 조합 검색 (+ 국가/언어 필터)
+        if mood_tags or genres or origin_country_filter or language_filter:
             params: dict = {}
 
             if mood_tags:
-                conditions.append("(m)-[:HAS_MOOD]->(:MoodTag {name: mood})")
                 params["mood_tags"] = mood_tags
 
             if genres:
-                conditions.append("(m)-[:HAS_GENRE]->(:Genre {name: genre})")
                 params["genres"] = genres
 
-            # 무드 + 장르 조합 쿼리
+            # 무드 + 장르 + 국가/언어 조합 쿼리
             cypher = """
             MATCH (m:Movie)
             WHERE
@@ -372,6 +420,16 @@ async def search_neo4j(
                 where_clauses.append(
                     "EXISTS { MATCH (m)-[:HAS_GENRE]->(g:Genre) WHERE g.name IN $genres }"
                 )
+            # ── 국가/언어 필터: Neo4j Movie 노드의 origin_country/original_language 속성 ──
+            if origin_country_filter:
+                # origin_country는 리스트 속성 → ANY()로 하나라도 일치하면 매칭
+                where_clauses.append(
+                    "ANY(c IN m.origin_country WHERE c IN $origin_country_filter)"
+                )
+                params["origin_country_filter"] = origin_country_filter
+            if language_filter:
+                where_clauses.append("m.original_language = $language_filter")
+                params["language_filter"] = language_filter
 
             cypher += " AND ".join(where_clauses)
 
@@ -572,17 +630,21 @@ async def hybrid_search(
     min_popularity: float | None = None,
     max_runtime: int | None = None,
     min_vote_count: int | None = None,
+    origin_country_filter: list[str] | None = None,
+    language_filter: str | None = None,
+    production_countries_filter: list[str] | None = None,
 ) -> list[SearchResult]:
     """
     3개 검색 엔진을 동시 실행하고 RRF로 합산하여 최종 후보를 반환한다.
 
     §11-1 하이브리드 검색 흐름:
-    ① Qdrant 벡터 검색 (의미) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count 필터 지원
-    ② ES BM25 검색 (키워드) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count 필터 지원
-    ③ Neo4j 그래프 검색 (관계)
+    ① Qdrant 벡터 검색 (의미) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count, 국가/언어 필터 지원
+    ② ES BM25 검색 (키워드) — min_rating, has_trailer, min_popularity, max_runtime, min_vote_count, 국가/언어 필터 지원
+    ③ Neo4j 그래프 검색 (관계) — 국가/언어 필터 지원
     ④ 시청 완료 영화 제외 (RRF 전)
     ⑤ RRF 합산 → 최종 후보
     ⑥ max_runtime 후처리 필터 (메타데이터 기반 2차 검증)
+    ⑦ origin_country 후처리 필터 (메타데이터 기반 2차 검증)
 
     Args:
         query: 사용자 검색 쿼리
@@ -599,6 +661,9 @@ async def hybrid_search(
         min_popularity: 인기도 최소값 필터 (TMDB popularity_score 기준)
         max_runtime: 최대 상영시간(분) 필터 — DB 필터 + RRF 후 후처리 2중 적용
         min_vote_count: 최소 투표수 필터 (평점 신뢰도 보장)
+        origin_country_filter: 창작 원산국 필터 (예: ["KR"]) — 한국영화, 일본 애니 등
+        language_filter: 원본 언어 필터 (예: "ko") — 영어 영화, 한국어 영화 등
+        production_countries_filter: 제작 국가 필터 (예: ["US"]) — 할리우드 영화 등
 
     Returns:
         RRF 합산 점수 기준 상위 top_k 결과
@@ -632,6 +697,9 @@ async def hybrid_search(
                     min_popularity=min_popularity,
                     max_runtime=max_runtime,
                     min_vote_count=min_vote_count,
+                    origin_country_filter=origin_country_filter,
+                    language_filter=language_filter,
+                    production_countries_filter=production_countries_filter,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -656,6 +724,9 @@ async def hybrid_search(
                     min_popularity=min_popularity,
                     max_runtime=max_runtime,
                     min_vote_count=min_vote_count,
+                    origin_country_filter=origin_country_filter,
+                    language_filter=language_filter,
+                    production_countries_filter=production_countries_filter,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -676,6 +747,8 @@ async def hybrid_search(
                     director=director,
                     similar_to_movie_id=similar_to_movie_id,
                     top_k=15,
+                    origin_country_filter=origin_country_filter,
+                    language_filter=language_filter,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -746,6 +819,60 @@ async def hybrid_search(
             logger.info(
                 "max_runtime_post_filter_applied",
                 max_runtime=max_runtime,
+                before=before_count,
+                after=len(fused),
+            )
+
+    # ── origin_country 후처리 필터 (§11-1 ⑦) ──
+    # DB 레벨 필터(Qdrant/ES/Neo4j)에서 누락될 수 있는 국가 조건을 RRF 합산 후 2차로 검증한다.
+    # 메타데이터에 origin_country가 없는 영화(None/빈 리스트)는 필터링하지 않는다 — 데이터 누락으로
+    # 제외하면 실제로는 조건을 만족할 수 있는 영화가 탈락하는 false negative가 발생하기 때문이다.
+    if origin_country_filter and fused:
+        filter_set = set(origin_country_filter)
+        before_count = len(fused)
+        fused = [
+            r for r in fused
+            if not r.metadata.get("origin_country")  # 데이터 없으면 통과 (false negative 방지)
+            or any(c in filter_set for c in r.metadata.get("origin_country", []))
+        ]
+        if before_count != len(fused):
+            logger.info(
+                "origin_country_post_filter_applied",
+                origin_country_filter=origin_country_filter,
+                before=before_count,
+                after=len(fused),
+            )
+
+    # ── original_language 후처리 필터 ──
+    if language_filter and fused:
+        before_count = len(fused)
+        fused = [
+            r for r in fused
+            if not r.metadata.get("original_language")  # 데이터 없으면 통과
+            or r.metadata.get("original_language") == language_filter
+        ]
+        if before_count != len(fused):
+            logger.info(
+                "language_post_filter_applied",
+                language_filter=language_filter,
+                before=before_count,
+                after=len(fused),
+            )
+
+    # ── production_countries 후처리 필터 ──
+    # Neo4j에는 production_countries 필터가 전달되지 않으므로 후처리로 보완한다.
+    if production_countries_filter and fused:
+        filter_set = set(production_countries_filter)
+        before_count = len(fused)
+        fused = [
+            r for r in fused
+            if not r.metadata.get("production_countries")  # 데이터 없으면 통과 (false negative 방지)
+            or any(c in filter_set for c in r.metadata.get("production_countries", []))
+        ]
+        if before_count != len(fused):
+            logger.info(
+                "production_countries_post_filter_applied",
+                production_countries_filter=production_countries_filter,
                 before=before_count,
                 after=len(fused),
             )

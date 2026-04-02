@@ -393,11 +393,15 @@ def calculate_similarity(candidate: dict[str, Any], movie: dict[str, Any]) -> fl
     """
     후보 영화와 선택 영화 간 종합 유사도를 계산한다 (§21-5).
 
-    4개 컴포넌트 가중합:
+    기본 4개 컴포넌트 가중치:
     - genre_sim   (0.35): 장르 Jaccard 유사도 — 함께 볼 영화에서 장르가 가장 중요
     - mood_sim    (0.25): 무드태그 Jaccard 유사도 — 분위기 일치가 시청 만족도에 기여
     - keyword_sim (0.15): 키워드 Jaccard 유사도 — 세부 테마 유사성 보조 지표
     - vector_sim  (0.25): 임베딩 벡터 Cosine 유사도 — 의미적 유사성 (줄거리 반영)
+
+    MySQL fallback 영화처럼 mood_tags/keywords/embedding이 없는 경우,
+    데이터가 있는 컴포넌트만으로 가중치를 재정규화하여 스코어링 왜곡을 방지한다.
+    (예: embedding/mood/keyword 모두 없으면 genre_sim 100%로 계산)
 
     Args:
         candidate: 후보 영화 dict (genres, mood_tags, keywords, embedding 포함)
@@ -430,13 +434,36 @@ def calculate_similarity(candidate: dict[str, Any], movie: dict[str, Any]) -> fl
         movie.get("embedding"),
     )
 
-    # 4개 컴포넌트 가중합
-    return (
-        0.35 * genre_sim
-        + 0.25 * mood_sim
-        + 0.15 * keyword_sim
-        + 0.25 * vector_sim
-    )
+    # ── 데이터 누락 시 가중치 동적 재정규화 ──
+    # MySQL fallback 영화는 mood_tags=[], keywords=[], embedding=None이므로
+    # 해당 컴포넌트의 유사도가 항상 0이 되어 65%가 무조건 0으로 계산되는 왜곡 발생.
+    # 양쪽 모두 데이터가 있는 컴포넌트만 가중합에 포함하여 공정하게 계산한다.
+    weights: list[tuple[float, float]] = []  # (가중치, 유사도) 쌍
+
+    # 장르는 항상 존재 (MySQL에도 있음)
+    weights.append((0.35, genre_sim))
+
+    # 무드: 양쪽 모두 mood_tags가 있어야 유효
+    has_mood = bool(candidate.get("mood_tags")) and bool(movie.get("mood_tags"))
+    if has_mood:
+        weights.append((0.25, mood_sim))
+
+    # 키워드: 양쪽 모두 keywords가 있어야 유효
+    has_keyword = bool(candidate.get("keywords")) and bool(movie.get("keywords"))
+    if has_keyword:
+        weights.append((0.15, keyword_sim))
+
+    # 임베딩: 양쪽 모두 embedding이 있어야 유효
+    has_embedding = candidate.get("embedding") is not None and movie.get("embedding") is not None
+    if has_embedding:
+        weights.append((0.25, vector_sim))
+
+    # 가중치 합이 1.0이 되도록 재정규화
+    total_weight = sum(w for w, _ in weights)
+    if total_weight <= 0:
+        return 0.0
+
+    return sum((w / total_weight) * sim for w, sim in weights)
 
 
 def calculate_match_score(

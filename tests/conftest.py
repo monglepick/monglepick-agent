@@ -188,12 +188,21 @@ def mock_ollama():
 
     controller = MockOllamaController()
 
-    # ChatOllama 생성자를 패치하여 mock 인스턴스를 반환 (Ollama 서버 불필요)
-    with patch("monglepick.llm.factory.ChatOllama", return_value=controller._mock_instance):
+    # ChatOllama + ChatOpenAI(Solar API) 생성자를 모두 패치하여 서버 불필요
+    # LLM_MODE=local_only, VLLM_ENABLED=False로 강제하여 외부 API 호출 방지
+    import monglepick.llm.factory as factory_module
+    from monglepick.config import settings as _settings
+
+    with (
+        patch("monglepick.llm.factory.ChatOllama", return_value=controller._mock_instance),
+        patch("monglepick.llm.factory.ChatOpenAI", return_value=controller._mock_instance),
+        patch.object(_settings, "LLM_MODE", "local_only"),
+        patch.object(_settings, "VLLM_ENABLED", False),
+    ):
         # LLM 캐시 초기화 (테스트 간 격리)
-        import monglepick.llm.factory as factory_module
         factory_module._ollama_cache.clear()
         factory_module._solar_cache.clear()
+        factory_module._vllm_cache.clear()
         factory_module._structured_cache.clear()
 
         yield controller
@@ -201,6 +210,7 @@ def mock_ollama():
         # 테스트 후 캐시 정리
         factory_module._ollama_cache.clear()
         factory_module._solar_cache.clear()
+        factory_module._vllm_cache.clear()
         factory_module._structured_cache.clear()
 
 

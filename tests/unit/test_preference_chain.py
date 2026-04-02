@@ -38,7 +38,8 @@ async def test_merge_overrides_prev(mock_ollama):
         ExtractedPreferences(genre_preference="SF"),
     )
     result = await extract_preferences("SF로 바꿔줘", previous_preferences=prev)
-    assert result.genre_preference == "SF"
+    # Phase ML-3: genre는 합집합 누적 ("액션" + "SF" = "액션, SF")
+    assert result.genre_preference == "액션, SF"
     # mood는 LLM이 None 반환 → 이전 값 유지
     assert result.mood == "유쾌"
 

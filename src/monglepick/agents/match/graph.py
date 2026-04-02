@@ -326,17 +326,13 @@ async def run_match_agent(
                         "message": current_message,
                     })
 
-                    # 다음 노드 진행 예고 메시지 즉시 발행
-                    # (장시간 노드 실행 중 keepalive가 정확한 메시지를 표시하도록)
+                    # 다음 노드 진행 상태를 keepalive용 변수에만 반영 (이벤트 중복 발행 방지)
+                    # 장시간 노드 실행 중 keepalive가 정확한 다음 단계 메시지를 표시한다.
                     next_node = _predict_next_node(node_name)
                     if next_node and next_node in NODE_STATUS_MESSAGES:
                         next_info = NODE_STATUS_MESSAGES[next_node]
                         current_phase = next_info["phase"]
                         current_message = next_info["message"]
-                        yield _format_sse_event("status", {
-                            "phase": current_phase,
-                            "message": current_message,
-                        })
 
                 # ── 특수 이벤트: feature_extractor 완료 → shared_features 발행 ──
                 # 프론트엔드에서 공통 특성 배지를 즉시 표시하기 위해 이른 시점에 발행
@@ -355,7 +351,13 @@ async def run_match_agent(
                             m.model_dump() if hasattr(m, "model_dump") else m
                             for m in ranked_movies
                         ]
-                        yield _format_sse_event("match_result", {"movies": movies_data})
+                        # 3편 미만이면 부분 결과 경고를 함께 전달 (설계서 §21-7 기준)
+                        partial = len(ranked_movies) < 3
+                        yield _format_sse_event("match_result", {
+                            "movies": movies_data,
+                            "partial": partial,
+                            **({"warning": "조건에 정확히 맞는 영화가 적어 일부만 추천해요."} if partial else {}),
+                        })
                     else:
                         # 추천 결과가 없음 (후보 부족 등)
                         yield _format_sse_event("error", {
@@ -367,16 +369,23 @@ async def run_match_agent(
                 # route_after_load에서 END로 분기하므로 그래프는 계속 실행되지 않음
                 if node_name == "movie_loader" and updates.get("error"):
                     error_msg = updates["error"]
-                    # 에러 코드 파싱: "MOVIE_NOT_FOUND:id1,id2" 형식
+                    # 에러 코드 파싱: "MOVIE_NOT_FOUND:id1,id2" 또는 "SERVICE_UNAVAILABLE:..." 형식
                     if ":" in error_msg:
                         error_code, detail = error_msg.split(":", 1)
                     else:
-                        error_code, detail = error_msg, "영화를 찾을 수 없어요."
+                        error_code, detail = error_msg, ""
 
-                    yield _format_sse_event("error", {
-                        "error_code": error_code,
-                        "message": f"선택한 영화를 찾을 수 없어요. (ID: {detail})",
-                    })
+                    # 인프라 장애와 영화 미발견을 구분하여 사용자 메시지 분리
+                    if error_code == "SERVICE_UNAVAILABLE":
+                        yield _format_sse_event("error", {
+                            "error_code": error_code,
+                            "message": "서버 연결에 문제가 있어요. 잠시 후 다시 시도해주세요.",
+                        })
+                    else:
+                        yield _format_sse_event("error", {
+                            "error_code": error_code,
+                            "message": f"선택한 영화를 찾을 수 없어요. (ID: {detail})",
+                        })
 
         # 완료 이벤트
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000

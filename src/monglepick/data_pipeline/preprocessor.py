@@ -85,6 +85,143 @@ OTT_NORMALIZE: dict[str, str] = {
 }
 
 # ============================================================
+# 상수: TMDB 키워드 영→한 매핑 테이블 (Phase ML-2)
+# ============================================================
+# TMDB API /movie/{id}/keywords는 항상 영문 키워드를 반환한다.
+# 사용자가 한국어로 검색할 때 BM25/벡터 매칭이 가능하도록
+# 주요 키워드 ~200개를 한국어로 매핑한다.
+# 매핑에 없는 키워드는 영문 원본을 유지한다 (벡터 검색의 cross-lingual 특성 활용).
+
+KEYWORD_EN_TO_KR: dict[str, str] = {
+    # ── 테마/분위기 ──
+    "based on novel": "소설 원작", "based on novel or book": "소설 원작",
+    "based on true story": "실화", "based on a true story": "실화",
+    "based on comic": "만화 원작", "based on comic book": "만화 원작",
+    "based on manga": "만화 원작",
+    "revenge": "복수", "redemption": "구원", "survival": "생존",
+    "dystopia": "디스토피아", "utopia": "유토피아",
+    "coming of age": "성장", "coming-of-age": "성장",
+    "underdog": "약자의 반전", "friendship": "우정",
+    "love": "사랑", "love triangle": "삼각관계",
+    "forbidden love": "금지된 사랑", "unrequited love": "짝사랑",
+    "family": "가족", "family relationships": "가족 관계",
+    "father son relationship": "부자 관계", "mother daughter relationship": "모녀 관계",
+    "sibling relationship": "형제자매",
+    "loneliness": "외로움", "isolation": "고립",
+    "grief": "슬픔", "loss": "상실", "death": "죽음",
+    "betrayal": "배신", "jealousy": "질투",
+    "corruption": "부패", "conspiracy": "음모",
+    "sacrifice": "희생", "faith": "신앙",
+    "ambition": "야망", "obsession": "집착",
+    "identity": "정체성", "self-discovery": "자아 발견",
+    "fate": "운명", "destiny": "운명",
+    "dream": "꿈", "nightmare": "악몽",
+    "memory": "기억", "amnesia": "기억상실",
+    "time": "시간", "time travel": "시간 여행", "time loop": "타임루프",
+    "parallel universe": "평행 우주", "alternate reality": "대체 현실",
+    "afterlife": "사후세계",
+    # ── 장소/배경 ──
+    "new york": "뉴욕", "new york city": "뉴욕", "los angeles": "로스앤젤레스",
+    "london": "런던", "paris": "파리", "tokyo": "도쿄", "seoul": "서울",
+    "high school": "고등학교", "college": "대학", "university": "대학",
+    "prison": "감옥", "hospital": "병원",
+    "island": "섬", "desert": "사막", "jungle": "정글", "forest": "숲",
+    "ocean": "바다", "mountain": "산", "small town": "시골 마을",
+    "space": "우주", "outer space": "우주", "spaceship": "우주선",
+    "mars": "화성", "moon": "달",
+    "castle": "성", "palace": "궁전",
+    "submarine": "잠수함", "airplane": "비행기", "train": "기차",
+    "haunted house": "귀신 집",
+    # ── 시대/역사 ──
+    "world war ii": "제2차 세계대전", "world war i": "제1차 세계대전",
+    "cold war": "냉전", "vietnam war": "베트남 전쟁",
+    "korean war": "한국전쟁", "civil war": "내전",
+    "medieval": "중세", "middle ages": "중세",
+    "ancient rome": "고대 로마", "ancient egypt": "고대 이집트",
+    "roman empire": "로마 제국",
+    "1920s": "1920년대", "1930s": "1930년대", "1940s": "1940년대",
+    "1950s": "1950년대", "1960s": "1960년대", "1970s": "1970년대",
+    "1980s": "1980년대", "1990s": "1990년대",
+    "historical fiction": "역사 소설", "period drama": "시대극",
+    # ── 직업/신분 ──
+    "detective": "탐정", "police": "경찰", "cop": "경찰",
+    "spy": "스파이", "secret agent": "비밀 요원",
+    "soldier": "군인", "warrior": "전사",
+    "assassin": "암살자", "hitman": "킬러",
+    "serial killer": "연쇄 살인범", "murder": "살인",
+    "thief": "도둑", "heist": "강도", "bank robbery": "은행 강도",
+    "lawyer": "변호사", "judge": "판사",
+    "doctor": "의사", "nurse": "간호사",
+    "teacher": "교사", "student": "학생",
+    "journalist": "기자", "writer": "작가",
+    "musician": "음악가", "singer": "가수", "dancer": "댄서",
+    "athlete": "운동선수", "boxer": "권투 선수",
+    "king": "왕", "queen": "여왕", "princess": "공주", "prince": "왕자",
+    "vampire": "뱀파이어", "zombie": "좀비", "werewolf": "늑대인간",
+    "ghost": "유령", "witch": "마녀", "wizard": "마법사",
+    "robot": "로봇", "android": "안드로이드", "cyborg": "사이보그",
+    "alien": "외계인", "extraterrestrial": "외계 생명체",
+    "superhero": "슈퍼히어로", "supervillain": "슈퍼빌런",
+    "pirate": "해적", "cowboy": "카우보이", "samurai": "사무라이",
+    "ninja": "닌자",
+    # ── 소재/장치 ──
+    "artificial intelligence": "인공지능", "virtual reality": "가상현실",
+    "hacking": "해킹", "computer": "컴퓨터", "technology": "기술",
+    "nuclear": "핵", "nuclear war": "핵전쟁",
+    "pandemic": "팬데믹", "virus": "바이러스", "plague": "전염병",
+    "magic": "마법", "sorcery": "마법", "supernatural": "초자연",
+    "prophecy": "예언", "curse": "저주",
+    "treasure": "보물", "treasure hunt": "보물 찾기",
+    "sword": "검", "martial arts": "무술", "kung fu": "쿵후",
+    "car chase": "자동차 추격", "race": "레이스",
+    "drug": "마약", "drug dealing": "마약 거래",
+    "gambling": "도박", "casino": "카지노",
+    "music": "음악", "rock music": "록 음악", "jazz": "재즈",
+    "dance": "춤", "ballet": "발레",
+    "sport": "스포츠", "football": "축구", "baseball": "야구",
+    "basketball": "농구", "boxing": "권투",
+    "cooking": "요리", "food": "음식",
+    "fashion": "패션", "photography": "사진",
+    "painting": "그림", "art": "예술",
+    "wedding": "결혼", "divorce": "이혼", "pregnancy": "임신",
+    "adoption": "입양",
+    # ── 분위기/스타일 ──
+    "dark comedy": "블랙 코미디", "satire": "풍자", "parody": "패러디",
+    "slapstick": "슬랩스틱", "romantic comedy": "로맨틱 코미디",
+    "psychological thriller": "심리 스릴러", "neo-noir": "네오 느와르",
+    "film noir": "필름 느와르", "noir": "느와르",
+    "mockumentary": "모큐멘터리",
+    "found footage": "파운드 푸티지",
+    "anthology": "옴니버스", "nonlinear timeline": "비선형 서사",
+    "plot twist": "반전", "surprise ending": "반전 결말",
+    "cliffhanger": "클리프행어",
+    "slow burn": "슬로우 번", "suspense": "서스펜스",
+    "gore": "고어", "torture": "고문", "violence": "폭력",
+    "erotic": "에로틱", "sexuality": "성적",
+    "animation": "애니메이션", "stop motion": "스톱모션",
+    "musical": "뮤지컬", "concert": "콘서트",
+    # ── 한국 특화 테마 ──
+    "korean": "한국", "south korea": "한국",
+    "k-drama": "한국 드라마", "joseon dynasty": "조선시대",
+    "gangster": "조폭", "organized crime": "조직 범죄",
+    "chaebol": "재벌", "military service": "군대",
+    # ── 일본/아시아 특화 ──
+    "anime": "애니메이션", "manga": "만화",
+    "yakuza": "야쿠자", "triad": "삼합회",
+    "wuxia": "무협", "xianxia": "선협",
+    # ── 미국 하이틴/청소년 ──
+    "prom": "프롬", "teenager": "10대", "teen": "10대",
+    "cheerleader": "치어리더", "fraternity": "대학 동아리",
+    "bullying": "괴롭힘", "popularity": "인기",
+    "first love": "첫사랑", "summer vacation": "여름 방학",
+    "road trip": "로드 트립", "camping": "캠핑",
+}
+
+# 소문자 키 기반 빠른 조회용 (대소문자 무시 매칭)
+_KEYWORD_EN_TO_KR_LOWER: dict[str, str] = {k.lower(): v for k, v in KEYWORD_EN_TO_KR.items()}
+
+
+# ============================================================
 # 전처리 함수
 # ============================================================
 
@@ -129,16 +266,100 @@ def extract_director(credits: dict) -> str:
     return ""
 
 
+def extract_director_names(credits: dict) -> tuple[str, str]:
+    """
+    credits.crew에서 감독의 name과 original_name을 모두 추출한다.
+
+    Phase ML-2: TMDB API는 ko-KR 요청 시 name에 한국어 이름(번역 있으면)을,
+    original_name에 원어 이름을 반환한다.
+    예) name="크리스토퍼 놀란", original_name="Christopher Nolan"
+    번역이 없으면 name=original_name="Christopher Nolan" (동일).
+
+    Returns:
+        (name, original_name) 튜플. 같으면 original_name은 빈 문자열.
+    """
+    crew = credits.get("crew", [])
+    for person in crew:
+        if person.get("job") == "Director":
+            name = person.get("name", "")
+            original_name = person.get("original_name", "")
+            # name과 original_name이 같으면 중복 저장 방지
+            if original_name == name:
+                original_name = ""
+            return name, original_name
+    return "", ""
+
+
 def extract_cast(credits: dict, top_n: int = 5) -> list[str]:
     """credits.cast에서 상위 N명 배우 이름을 추출한다."""
     cast = credits.get("cast", [])
     return [person.get("name", "") for person in cast[:top_n] if person.get("name")]
 
 
+def extract_cast_names(credits: dict, top_n: int = 5) -> list[str]:
+    """
+    credits.cast에서 상위 N명의 name + original_name을 모두 추출한다.
+
+    Phase ML-2: 한글 이름과 영문 이름을 모두 포함하여
+    "톰 크루즈" 또는 "Tom Cruise" 어느 쪽으로 검색해도 매칭되도록 한다.
+
+    Returns:
+        중복 제거된 이름 리스트 (최대 top_n*2개)
+        예: ["톰 크루즈", "Tom Cruise", "마일스 텔러", "Miles Teller", ...]
+    """
+    cast = credits.get("cast", [])
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for person in cast[:top_n]:
+        name = person.get("name", "")
+        original_name = person.get("original_name", "")
+
+        if name and name not in seen:
+            result.append(name)
+            seen.add(name)
+        # original_name이 name과 다르면 추가 (한/영 이중 저장)
+        if original_name and original_name != name and original_name not in seen:
+            result.append(original_name)
+            seen.add(original_name)
+
+    return result
+
+
 def extract_keywords(keywords_data: dict) -> list[str]:
-    """keywords 객체에서 키워드 이름 리스트를 추출한다."""
+    """
+    keywords 객체에서 키워드 이름 리스트를 추출한다.
+
+    Phase ML-2: TMDB API는 항상 영문 키워드를 반환하므로,
+    KEYWORD_EN_TO_KR 매핑 테이블로 한국어 변환을 시도한다.
+    매핑에 없는 키워드는 영문 원본과 함께 반환하여
+    벡터 검색의 cross-lingual 특성을 활용한다.
+
+    Returns:
+        한국어 변환된 키워드 + 원본 영문 키워드 (중복 제거)
+        예: ["시간 여행", "time travel", "디스토피아", "dystopia", "rebellion"]
+    """
     keywords = keywords_data.get("keywords", [])
-    return [kw.get("name", "") for kw in keywords if kw.get("name")]
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for kw in keywords:
+        name = kw.get("name", "")
+        if not name:
+            continue
+
+        # 한국어 매핑이 있으면 한국어를 우선 추가
+        kr_name = _KEYWORD_EN_TO_KR_LOWER.get(name.lower())
+        if kr_name and kr_name not in seen:
+            result.append(kr_name)
+            seen.add(kr_name)
+
+        # 영문 원본도 추가 (벡터 검색 + 영문 쿼리 대응)
+        if name not in seen:
+            result.append(name)
+            seen.add(name)
+
+    return result
 
 
 # ============================================================
@@ -698,20 +919,37 @@ def build_embedding_text(doc: MovieDocument) -> str:
     - certification (관람등급) 추가
     - reviews[0][:300] (첫 번째 리뷰 300자) 추가: 영화 평가 맥락 제공
 
-    형식: [제목] {title} [장르] {genres} [감독] {director} [출연] {cast}
-          [키워드] {keywords} [무드] {mood_tags} [관람등급] {certification}
-          [줄거리] {overview} [리뷰] {reviews[0][:300]}
+    Phase ML (다국어 검색 개선):
+    - title_en (영문 제목) 추가: 한글 제목과 다를 경우 벡터 공간에 영문 의미도 반영
+    - overview_en (영문 줄거리) 추가: 한글 줄거리가 빈약한 경우 영문 줄거리로 보강
+      → Upstage Solar 임베딩 모델의 다국어 지원 특성을 활용하여
+        영문 쿼리 ↔ 한글+영문 혼합 임베딩 간 벡터 유사도 매칭 개선
+
+    형식: [제목] {title} [영문제목] {title_en} [장르] {genres} [감독] {director}
+          [출연] {cast} [키워드] {keywords} [무드] {mood_tags} [관람등급] {certification}
+          [줄거리] {overview} [영문줄거리] {overview_en} [리뷰] {reviews[0][:300]}
     """
     parts = [
         f"[제목] {doc.title}",
-        f"[장르] {', '.join(doc.genres)}",
     ]
+    # Phase ML: 영문 제목이 있고 한글 제목과 다를 경우 추가
+    # → 벡터 공간에 영문 의미도 반영되어 영문 쿼리 매칭 개선
+    if doc.title_en and doc.title_en != doc.title:
+        parts.append(f"[영문제목] {doc.title_en}")
+
+    parts.append(f"[장르] {', '.join(doc.genres)}")
+
     # Phase B: 태그라인 추가 (캐치프레이즈가 있으면 임베딩에 반영)
     if doc.tagline:
         parts.append(f"[태그라인] {doc.tagline}")
     if doc.director:
         parts.append(f"[감독] {doc.director}")
+    # Phase ML-2: 감독 원어 이름이 있고 지역화 이름과 다르면 추가
+    # → "크리스토퍼 놀란" + "Christopher Nolan" 양방향 임베딩 매칭
+    if doc.director_original_name and doc.director_original_name != doc.director:
+        parts.append(f"[감독원어] {doc.director_original_name}")
     if doc.cast:
+        # Phase ML-2: cast에 이미 한영 이름이 모두 포함됨 (extract_cast_names)
         parts.append(f"[출연] {', '.join(doc.cast)}")
     # Phase B: 확장 크레딧 추가
     if doc.screenwriters:
@@ -727,6 +965,10 @@ def build_embedding_text(doc: MovieDocument) -> str:
     if doc.overview:
         # Phase A: 200자 제한 해제 → 전체 줄거리 사용
         parts.append(f"[줄거리] {doc.overview}")
+    # Phase ML: 영문 줄거리 보강 — 한글 줄거리가 없거나 빈약한(50자 미만) 경우
+    # 영문 줄거리를 500자까지 포함하여 임베딩 품질 보완
+    if doc.overview_en and (not doc.overview or len(doc.overview) < 50):
+        parts.append(f"[영문줄거리] {doc.overview_en[:500]}")
     if doc.reviews:
         # Phase A: 첫 번째 리뷰 300자 추가 (영화 평가 맥락)
         parts.append(f"[리뷰] {doc.reviews[0][:300]}")
@@ -903,7 +1145,13 @@ async def process_raw_movie(raw: TMDBRawMovie, generate_mood: bool = True) -> Mo
     director = extract_director(raw.credits)
     cast = extract_cast(raw.credits)
 
-    # 키워드 추출
+    # Phase ML-2: 감독/배우 한영 이중 이름 추출
+    # name(지역화)과 original_name(원어)을 모두 추출하여
+    # "크리스토퍼 놀란" / "Christopher Nolan" 양방향 검색 지원
+    director_name, director_original_name_extracted = extract_director_names(raw.credits)
+    cast_all_names = extract_cast_names(raw.credits)
+
+    # 키워드 추출 (Phase ML-2: 한국어 매핑 포함)
     keywords = extract_keywords(raw.keywords)
 
     # OTT 정규화
@@ -983,7 +1231,10 @@ async def process_raw_movie(raw: TMDBRawMovie, generate_mood: bool = True) -> Mo
         genres=genres,
         keywords=keywords,
         director=director,
-        cast=cast,
+        # Phase ML-2: cast에 한영 이름을 모두 포함하여 양방향 검색 지원
+        # 예: ["톰 크루즈", "Tom Cruise", "마일스 텔러", "Miles Teller"]
+        # 기존 cast(name만)와 cast_all_names(name+original_name) 중 이중 이름 버전 사용
+        cast=cast_all_names if cast_all_names else cast,
         ott_platforms=ott_platforms,
         # Phase A: 보강 필드
         reviews=reviews,

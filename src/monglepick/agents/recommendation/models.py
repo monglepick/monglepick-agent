@@ -42,6 +42,12 @@ class RecommendationEngineState(TypedDict, total=False):
     mood_tags: list[str]                      # emotion.mood_tags (감정→무드 매핑)
     preferences: ExtractedPreferences | None  # 사용자 선호 조건 (7개 필드)
 
+    # ── Phase 3: 암시적 평점 ──
+    implicit_ratings: dict[str, float]        # {movie_id: implicit_score} CF fallback용
+
+    # ── Phase 4: 행동 프로필 ──
+    user_behavior_profile: dict[str, Any]     # taste_consistency, genre_affinity 등
+
     # ── 내부 상태 ──
     is_cold_start: bool                       # Cold Start 여부 (시청 < 5편)
     cf_cache_miss: bool                       # CF 캐시 미스 여부 (Redis에 유사 유저 없음)

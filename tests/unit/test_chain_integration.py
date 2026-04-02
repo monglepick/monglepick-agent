@@ -97,17 +97,22 @@ async def test_sufficient_prefs_skip_question(mock_ollama):
 
 @pytest.mark.asyncio
 async def test_insufficient_prefs_generate_question(mock_ollama):
-    """genre만(2.0), turn=1 → is_sufficient=False → 질문 생성."""
-    # 선호 추출
-    mock_ollama.set_structured_response(
-        ExtractedPreferences(genre_preference="SF"),
-    )
-    prefs = await extract_preferences("SF 영화")
-    assert not is_sufficient(prefs, turn_count=1)
+    """핵심 필드 모두 비어있음, turn=1 → is_sufficient=False → 질문 생성.
 
-    # 질문 생성
+    Intent-First 아키텍처에서는 genre/mood/reference_movies/user_intent/dynamic_filters
+    모두 비어있어야 불충분 판정 (OR 조건 기반).
+    """
+    # 선호 추출 — 핵심 필드가 모두 비어있는 경우 (예: "영화 추천해줘" 같은 모호한 입력)
+    empty_prefs = ExtractedPreferences()  # 모든 필드 None/빈값
+    assert not is_sufficient(empty_prefs, turn_count=1)
+
+    # genre만 있으면 Intent-First에서 충분 판정
+    genre_only_prefs = ExtractedPreferences(genre_preference="SF")
+    assert is_sufficient(genre_only_prefs, turn_count=1)
+
+    # 질문 생성 (불충분한 경우)
     mock_ollama.set_response("어떤 분위기의 영화가 끌리세요? 🎬")
-    question = await generate_question(prefs, turn_count=1)
+    question = await generate_question(empty_prefs, turn_count=1)
     assert isinstance(question, str)
     assert len(question) > 0
 
@@ -118,12 +123,14 @@ async def test_insufficient_prefs_generate_question(mock_ollama):
 
 
 def test_turn_count_override():
-    """선호 비어있어도 turn_count≥2 → is_sufficient=True (TURN_COUNT_OVERRIDE=2)."""
+    """Phase ML-3: 선호 비어있어도 turn_count≥3 → is_sufficient=True (TURN_COUNT_OVERRIDE=3)."""
     prefs = ExtractedPreferences()  # 모두 None
     # turn_count=1 → 아직 부족
     assert is_sufficient(prefs, turn_count=1) is False
-    # turn_count=2 → 오버라이드 (2턴째부터 추천 진행)
-    assert is_sufficient(prefs, turn_count=2) is True
+    # turn_count=2 → 아직 부족 (Phase ML-3: 재질문 2회 기회)
+    assert is_sufficient(prefs, turn_count=2) is False
+    # turn_count=3 → 오버라이드 (3턴째부터 강제 추천)
+    assert is_sufficient(prefs, turn_count=3) is True
 
 
 # ============================================================

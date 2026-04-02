@@ -25,6 +25,7 @@ LangGraph StateGraph의 각 노드로 등록되는 13개 async 함수.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import traceback
@@ -134,9 +135,11 @@ async def context_loader(state: ChatAgentState) -> dict:
                 "turn_count": turn_count,
             }
 
-        # 첫 턴: MySQL에서 유저 프로필 + 시청 이력 로드
+        # 첫 턴: MySQL에서 유저 프로필 + 시청 이력 + 암시적 평점 + 행동 프로필 로드
         user_profile: dict[str, Any] = {}
         watch_history: list[dict[str, Any]] = []
+        implicit_ratings: dict[str, float] = {}  # Phase 3
+        user_behavior_profile: dict[str, Any] = {}  # Phase 4
 
         try:
             pool = await get_mysql()
@@ -151,10 +154,14 @@ async def context_loader(state: ChatAgentState) -> dict:
                     if row:
                         user_profile = dict(row)
 
-                    # 시청 이력 조회 (최근 50건, 영화 제목 포함)
+                    # 시청 이력 조회 (최근 50건, 영화 메타데이터 포함)
+                    # — Phase 0: genres, director, cast, mood_tags, popularity_score 추가
+                    #   CBF에서 장르/감독/배우/무드 프로필 구축에 활용
                     await cursor.execute(
                         """
-                        SELECT wh.movie_id, m.title, wh.rating, wh.watched_at
+                        SELECT wh.movie_id, m.title, wh.rating, wh.watched_at,
+                               m.genres, m.director, m.cast_members AS `cast`,
+                               m.mood_tags, m.popularity_score, m.rating AS movie_rating
                         FROM watch_history wh
                         LEFT JOIN movies m ON wh.movie_id = m.movie_id
                         WHERE wh.user_id = %s
@@ -165,6 +172,59 @@ async def context_loader(state: ChatAgentState) -> dict:
                     )
                     rows = await cursor.fetchall()
                     watch_history = [dict(r) for r in rows]
+
+                    # JSON 문자열 → list 파싱 (genres, cast, mood_tags)
+                    for wh in watch_history:
+                        for key in ("genres", "cast", "mood_tags"):
+                            val = wh.get(key)
+                            if isinstance(val, str):
+                                try:
+                                    parsed = json.loads(val)
+                                    wh[key] = parsed if isinstance(parsed, list) else []
+                                except (json.JSONDecodeError, TypeError):
+                                    wh[key] = []
+                            elif not isinstance(val, list):
+                                wh[key] = []
+
+                    # Phase 3: 암시적 평점 조회 (user_implicit_rating 테이블)
+                    # CF 캐시 미스 시 fallback 점수로 활용
+                    await cursor.execute(
+                        """
+                        SELECT movie_id, implicit_score
+                        FROM user_implicit_rating
+                        WHERE user_id = %s AND implicit_score > 0
+                        ORDER BY implicit_score DESC
+                        LIMIT 200
+                        """,
+                        (user_id,),
+                    )
+                    ir_rows = await cursor.fetchall()
+                    implicit_ratings = {r["movie_id"]: float(r["implicit_score"]) for r in ir_rows}
+
+                    # Phase 4: 행동 프로필 조회 (user_behavior_profile 테이블)
+                    # hybrid_merger에서 taste_consistency 기반 동적 가중치에 활용
+                    await cursor.execute(
+                        """
+                        SELECT genre_affinity, mood_affinity, director_affinity,
+                               taste_consistency, recommendation_acceptance_rate,
+                               avg_exploration_depth, activity_level
+                        FROM user_behavior_profile
+                        WHERE user_id = %s
+                        LIMIT 1
+                        """,
+                        (user_id,),
+                    )
+                    bp_row = await cursor.fetchone()
+                    if bp_row:
+                        user_behavior_profile = dict(bp_row)
+                        # JSON 문자열 → dict 파싱
+                        for key in ("genre_affinity", "mood_affinity", "director_affinity"):
+                            val = user_behavior_profile.get(key)
+                            if isinstance(val, str):
+                                try:
+                                    user_behavior_profile[key] = json.loads(val)
+                                except (json.JSONDecodeError, TypeError):
+                                    user_behavior_profile[key] = {}
         except Exception as db_err:
             # DB 에러 시에도 빈 기본값으로 계속 진행
             logger.warning("context_loader_db_error", error=str(db_err))
@@ -186,6 +246,8 @@ async def context_loader(state: ChatAgentState) -> dict:
             "watch_history": watch_history,
             "messages": messages,
             "turn_count": turn_count,
+            "implicit_ratings": implicit_ratings,
+            "user_behavior_profile": user_behavior_profile,
         }
 
     except Exception as e:
@@ -831,6 +893,18 @@ async def query_builder(state: ChatAgentState) -> dict:
                 filters["min_popularity"] = float(fc.value)
             elif fc.field == "vote_count" and fc.operator == "gte":
                 filters["min_vote_count"] = int(fc.value)
+            # ── 국가/언어 동적 필터 (한국영화, 일본 애니 등 국가 기반 추천) ──
+            elif fc.field == "origin_country" and fc.operator == "contains":
+                # origin_country는 리스트로 누적 (여러 국가 OR 조건 가능)
+                existing = filters.get("origin_country", [])
+                existing.append(str(fc.value).upper())
+                filters["origin_country"] = existing
+            elif fc.field == "original_language" and fc.operator == "eq":
+                filters["original_language"] = str(fc.value).lower()
+            elif fc.field == "production_countries" and fc.operator == "contains":
+                existing = filters.get("production_countries", [])
+                existing.append(str(fc.value).upper())
+                filters["production_countries"] = existing
 
         # ── boost_keywords 구성 (기존 + 새 search_keywords 통합) ──
         boost_keywords: list[str] = []
@@ -946,6 +1020,9 @@ def _search_result_to_candidate(result: SearchResult, rank: int) -> CandidateMov
         popularity_score=popularity_val,
         vote_count=vote_count_val,
         backdrop_path=backdrop_val,
+        # ── 국가/언어 필드 (한국영화 필터링 및 재랭킹 시 국가 판별용) ──
+        original_language=meta.get("original_language", ""),
+        origin_country=meta.get("origin_country", []) if isinstance(meta.get("origin_country"), list) else [],
     )
 
 
@@ -985,6 +1062,10 @@ async def rag_retriever(state: ChatAgentState) -> dict:
         min_popularity = filters.get("min_popularity")    # float | None — TMDB 인기도 최소값
         max_runtime = filters.get("max_runtime")          # int | None — 최대 상영시간(분)
         min_vote_count = filters.get("min_vote_count")    # int | None — 최소 투표수
+        # ── 국가/언어 필터 파라미터 추출 (한국영화 필터링) ──
+        origin_country = filters.get("origin_country")            # list[str] | None — 예: ["KR"]
+        original_language = filters.get("original_language")      # str | None — 예: "ko"
+        production_countries = filters.get("production_countries") # list[str] | None — 예: ["US"]
 
         # 선호에서 참조영화 ID 추출 (Neo4j 검색용)
         preferences = state.get("preferences")
@@ -994,7 +1075,7 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             if ref_info:
                 similar_movie_id = ref_info
 
-        # 하이브리드 검색 실행 — 동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count) 전달
+        # 하이브리드 검색 실행 — 동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count, 국가/언어) 전달
         results = await hybrid_search(
             query=search_query.semantic_query or search_query.keyword_query,
             top_k=search_query.limit,
@@ -1010,6 +1091,9 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             min_popularity=min_popularity,
             max_runtime=max_runtime,
             min_vote_count=min_vote_count,
+            origin_country_filter=origin_country,
+            language_filter=original_language,
+            production_countries_filter=production_countries,
         )
 
         # SearchResult → CandidateMovie 변환
@@ -1053,6 +1137,28 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             if len(filtered) >= 2:
                 candidates = filtered
 
+        # ── 국가/언어 후처리: CandidateMovie.origin_country/original_language로 2차 검증 ──
+        # hybrid_search 내부에서 이미 DB 레벨 필터를 적용했지만,
+        # 메타데이터 불일치나 Neo4j 결과 누락을 보완하기 위해 후처리로 재검증한다.
+        if origin_country and candidates:
+            filter_set = set(origin_country)
+            filtered = [
+                c for c in candidates
+                if not c.origin_country  # 데이터 없으면 통과 (false negative 방지)
+                or any(cc in filter_set for cc in c.origin_country)
+            ]
+            if len(filtered) >= 2:
+                candidates = filtered
+
+        if original_language and candidates:
+            filtered = [
+                c for c in candidates
+                if not c.original_language  # 데이터 없으면 통과
+                or c.original_language == original_language
+            ]
+            if len(filtered) >= 2:
+                candidates = filtered
+
         if pre_filter_count != len(candidates):
             logger.info(
                 "rag_post_filter_applied",
@@ -1060,6 +1166,8 @@ async def rag_retriever(state: ChatAgentState) -> dict:
                 after=len(candidates),
                 has_trailer=has_trailer,
                 min_rating=min_rating,
+                origin_country=origin_country,
+                original_language=original_language,
             )
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000

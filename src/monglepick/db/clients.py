@@ -445,7 +445,15 @@ ES_INDEX_SETTINGS = {
             # ── Phase C: 완전 데이터 추출 ──
             "origin_country": {"type": "keyword"},
             "director_id": {"type": "integer"},
-            "alternative_titles": {"type": "text", "analyzer": "korean_analyzer"},
+            # Phase ML (다국어 검색 개선): 대체 제목에 영문/일문 등 다국어 혼재
+            # → standard analyzer 기본 + .korean 서브필드로 한국어 분석 병행
+            "alternative_titles": {
+                "type": "text",
+                "analyzer": "standard",
+                "fields": {
+                    "korean": {"type": "text", "analyzer": "korean_analyzer"}
+                }
+            },
             "recommendation_ids": {"type": "keyword"},
             "kr_release_date": {"type": "keyword"},
             "video_flag": {"type": "boolean"},
