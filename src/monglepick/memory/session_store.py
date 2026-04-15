@@ -326,11 +326,25 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
         state: 그래프 실행 완료 후의 전체 State dict
     """
     # [가드] 빈 session_id / user_id 는 저장 대상 아님 (익명·에러 케이스)
+    # Phase 1 진단 로그 강화 (2026-04-15):
+    # "로그인 사용자인데 JWT 검증 실패 → user_id 빈 문자열 → 저장 스킵" 케이스가
+    # 실제 운영에서 채팅 이력 미표시의 근본원인이므로 WARNING → ERROR 로 상향하여
+    # 알림/대시보드에서 즉시 포착되도록 한다. turn_count 를 함께 기록하여
+    # "첫 턴 저장 실패" vs "N턴 진행 후 실패" 구분 가능.
     if not session_id:
-        logger.warning("session_save_skipped_no_session_id")
+        logger.error(
+            "session_save_skipped_no_session_id",
+            user_id=user_id,
+            turn_count=state.get("turn_count", 0),
+        )
         return
     if not user_id:
-        logger.warning("session_save_skipped_no_user_id", session_id=session_id)
+        logger.error(
+            "session_save_skipped_no_user_id",
+            session_id=session_id,
+            turn_count=state.get("turn_count", 0),
+            message_count=len(state.get("messages", [])),
+        )
         return
 
     try:

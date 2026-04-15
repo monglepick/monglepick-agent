@@ -84,6 +84,11 @@ def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
     JWT_SECRET이 미설정이면 검증을 건너뛴다 (개발 환경 호환).
     JWT가 유효하면 subject(user_id)를 반환하고, 유효하지 않으면 None을 반환한다.
 
+    Phase 1 진단 로그 강화 (2026-04-15):
+    - JWT 검증 실패 원인을 `request.state.jwt_failure_reason` 에 기록하여
+      상위 `_resolve_user_id` 가 경고 로그에 포함할 수 있게 한다.
+    - 기존에는 `DEBUG` 레벨이라 운영 로그에서 보이지 않아 근본원인 특정이 어려웠다.
+
     Args:
         raw_request: FastAPI Request 객체
 
@@ -97,6 +102,8 @@ def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
     # Authorization 헤더 추출
     auth_header = raw_request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
+        # 헤더 자체 없음 → 진짜 게스트일 수 있으므로 reason 만 기록
+        raw_request.state.jwt_failure_reason = "no_bearer_header"
         return None
 
     token = auth_header[7:]  # "Bearer " 이후
@@ -111,17 +118,29 @@ def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
         # Refresh Token은 거부 (access token만 허용)
         if payload.get("type") == "refresh":
             logger.warning("jwt_refresh_token_rejected")
+            raw_request.state.jwt_failure_reason = "refresh_token_not_allowed"
             return None
         # subject = user_id
         user_id = payload.get("sub", "")
         if user_id:
             return user_id
+        # 토큰은 유효하나 sub 가 비어있음 → Backend 발급 오류 의심
+        raw_request.state.jwt_failure_reason = "empty_sub_claim"
         return None
     except jwt.ExpiredSignatureError:
-        logger.debug("jwt_expired")
+        # Phase 1: DEBUG → WARNING 상향. 만료가 잦으면 Client refresh 로직 점검 대상
+        logger.warning("jwt_expired")
+        raw_request.state.jwt_failure_reason = "expired"
         return None
     except jwt.InvalidTokenError as e:
-        logger.debug("jwt_invalid", error=str(e))
+        # Phase 1: DEBUG → WARNING 상향. 서명 불일치(JWT_SECRET 환경변수 불일치)
+        # vs 포맷 오류 vs 알고리즘 불일치 등을 error_type 으로 구분 가능하게 한다.
+        logger.warning(
+            "jwt_invalid",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        raw_request.state.jwt_failure_reason = f"invalid:{type(e).__name__}"
         return None
 
 
@@ -155,10 +174,25 @@ def _resolve_user_id(request_user_id: str, raw_request: Request) -> str:
 
     if settings.JWT_SECRET:
         # JWT_SECRET 설정됨 + JWT 없음/무효 → body의 user_id 무시 (스푸핑 방지)
+        # Phase 1 진단 로그 강화 (2026-04-15):
+        # JWT 실패 사유(jwt_failure_reason)와 Authorization 헤더 유무를 함께 기록하여
+        # 운영 로그에서 "Client 가 헤더를 안 보내는 것" vs "토큰 만료" vs "서명 불일치"를
+        # 즉시 구분할 수 있게 한다.
+        jwt_failure_reason = getattr(raw_request.state, "jwt_failure_reason", "unknown")
+        has_auth_header = bool(raw_request.headers.get("Authorization"))
         if request_user_id:
             logger.warning(
                 "no_valid_jwt_body_user_id_ignored",
                 body_user_id=request_user_id,
+                jwt_failure_reason=jwt_failure_reason,
+                has_auth_header=has_auth_header,
+            )
+        else:
+            # body user_id 도 없고 JWT 도 없음 → 진짜 게스트. Phase 3 에서 guest_id 로 식별 예정.
+            logger.info(
+                "anonymous_request_no_jwt",
+                jwt_failure_reason=jwt_failure_reason,
+                has_auth_header=has_auth_header,
             )
         return ""  # 익명 처리
 
