@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 import uuid
 from collections.abc import AsyncGenerator
 
@@ -494,11 +495,15 @@ async def run_admin_assistant(
 
     except Exception as e:
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
+        # Step 6b 후속 디버깅(2026-04-23): 실전에서 `'NoneType' object is not iterable`
+        # 같은 에러가 원인 지점 불명으로 올라왔다. 스택 트레이스를 로그에 남겨 다음
+        # 재현에서 정확한 프레임을 특정한다.
         logger.error(
             "admin_assistant_stream_error",
             error=str(e),
             error_type=type(e).__name__,
             elapsed_ms=round(graph_elapsed_ms, 1),
+            stack_trace=traceback.format_exc(),
         )
         yield _format_sse_event("error", {"message": str(e)})
         yield _format_sse_event("done", {})
