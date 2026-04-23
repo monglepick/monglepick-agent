@@ -219,6 +219,8 @@ async def run_match_agent(
     movie_id_1: str,
     movie_id_2: str,
     user_id: str = "",
+    guest_id: str = "",
+    client_ip: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
     Movie Match Agent를 SSE 스트리밍 모드로 실행한다.
@@ -240,6 +242,9 @@ async def run_match_agent(
         movie_id_1: 첫 번째 선택 영화 ID
         movie_id_2: 두 번째 선택 영화 ID
         user_id   : 요청 사용자 ID (선택, 로그용)
+        guest_id  : 비로그인 게스트 쿠키 UUID (2026-04-22, Phase 3).
+                    explanation_generator 완료 시 평생 1회 쿼터 소비에 사용.
+        client_ip : 실제 클라이언트 IP. 게스트 쿠키 삭제 후 재진입 방어선.
 
     Yields:
         SSE 이벤트 dict {"event": str, "data": str}
@@ -363,6 +368,29 @@ async def run_match_agent(
                 if node_name == "explanation_generator":
                     ranked_movies: list[MatchedMovie] = updates.get("ranked_movies", [])
                     if ranked_movies:
+                        # ── 게스트(비로그인) 평생 1회 쿼터 소비 (2026-04-22, Phase 3) ──
+                        # Match 는 Chat 과 달리 movie_card 가 개별 yield 되지 않고 match_result 1개로 묶여 발행되므로,
+                        # match_result yield 직전에 1회만 consume 하면 충분하다 (중복 차감 불가).
+                        # 로그인 유저는 Match 에서 포인트 차감 대상이 아니므로 별도 처리 없음.
+                        if not user_id and guest_id and client_ip:
+                            try:
+                                from monglepick.api.guest_quota_client import consume_quota
+                                guest_consume = await consume_quota(guest_id, client_ip)
+                                logger.info(
+                                    "match_guest_quota_consumed",
+                                    guest_id=guest_id,
+                                    client_ip=client_ip,
+                                    success=guest_consume.success,
+                                    reason=guest_consume.reason,
+                                )
+                            except Exception as guest_err:
+                                # fail-open: consume 실패해도 match_result 는 그대로 발행
+                                logger.warning(
+                                    "match_guest_quota_consume_failed_graceful",
+                                    guest_id=guest_id,
+                                    error=str(guest_err),
+                                )
+
                         movies_data = [
                             m.model_dump() if hasattr(m, "model_dump") else m
                             for m in ranked_movies

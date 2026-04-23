@@ -44,6 +44,23 @@ _MAX_SEARCH_RESULTS = 5
 # 동일 세션 내 같은 영화에 대한 중복 검색 방지
 _enrichment_cache: dict[str, str] = {}
 
+# ── 신뢰 도메인 우선순위 (낮은 인덱스일수록 우선) ──
+# 2026-04-23 후속 과제 (P2): 한국 영화 매칭 정확도를 높이기 위해 한국영화DB(KMDB)
+# 와 영화진흥위원회(KOBIS) 를 Wikipedia/나무위키보다 상위로 승격.
+# KMDB 는 한국영상자료원이 운영하는 공식 영화 정보 DB 로 배우·감독·OTT·등급 등
+# 구조화된 메타데이터를 제공하고, KOBIS 는 공식 박스오피스/개봉정보를 제공한다.
+# Wikipedia 는 영문 우선이라 한국 영화 문서가 누락되거나 번역 지연이 있을 수 있고,
+# 나무위키는 주관적 서술/팬덤 편집이 섞일 수 있으므로 2·3 순위로 유지.
+# 이 리스트는 _merge_search_results() 와 _extract_movie_candidates() 두 곳에서
+# 참조된다 — 단일 진실 원본으로 유지하기 위해 모듈 상수로 추출.
+_PRIORITY_DOMAINS: list[str] = [
+    "kmdb.or.kr",       # 1순위: 한국영상자료원 공식 영화 DB (한국 영화 최우선)
+    "kobis.or.kr",      # 2순위: 영화진흥위원회 박스오피스 (개봉·스크린·관객)
+    "wikipedia.org",    # 3순위: 한/영 위키피디아 (일반 영화 광범위 커버)
+    "namu.wiki",        # 4순위: 나무위키 (한국 팝컬처 상세, 주관적 서술 주의)
+    "imdb.com",         # 5순위: IMDB (해외 영화 메타데이터)
+]
+
 
 def _needs_enrichment(overview: str | None) -> bool:
     """
@@ -183,16 +200,14 @@ def _merge_search_results(results: list[dict[str, str]]) -> str:
     if not results:
         return ""
 
-    # Wikipedia/나무위키 등 신뢰할 수 있는 소스 우선 정렬
-    _priority_domains = ["wikipedia.org", "namu.wiki", "kmdb.or.kr", "kobis.or.kr", "imdb.com"]
-
+    # 신뢰 도메인 우선 정렬 (모듈 상수 _PRIORITY_DOMAINS 참조)
     def _source_priority(result: dict) -> int:
         """소스 도메인에 따른 우선순위 (낮을수록 우선)."""
         href = result.get("href", "")
-        for i, domain in enumerate(_priority_domains):
+        for i, domain in enumerate(_PRIORITY_DOMAINS):
             if domain in href:
                 return i
-        return len(_priority_domains)  # 기타 소스는 최하위
+        return len(_PRIORITY_DOMAINS)  # 기타 소스는 최하위
 
     # 우선순위순 정렬
     sorted_results = sorted(results, key=_source_priority)
@@ -429,3 +444,318 @@ def clear_enrichment_cache() -> None:
     """
     _enrichment_cache.clear()
     logger.debug("enrichment_cache_cleared")
+
+
+# ============================================================
+# 외부 검색 전용 유틸 — "DB 에 없는 신작" fallback 용
+# ============================================================
+#
+# 이 구간은 DB 에서 추천 후보가 0 건이지만 사용자가 "최신 영화" 같은
+# 시기 시그널을 명시한 경우에 external_search_node 가 호출한다.
+# 기존 enrich_movie_overview() 와 달리 "영화 자체를 외부에서 찾아오는"
+# 용도이므로, 결과 텍스트에서 영화 제목/연도를 추출하고 별도의 스텁
+# dict 를 생성해 응답 레이어로 넘길 수 있게 한다.
+# ============================================================
+
+# 검색 결과에서 영화 제목을 뽑아내기 위한 정규식.
+# 예) "인터스텔라(2014) 영화 정보", "영화 '괴물' (2006) 줄거리" 등
+#     - 『영화명』 / 「영화명」 / '영화명' / "영화명" 4종 + 앞뒤 연도 괄호
+_TITLE_QUOTED_PATTERN = re.compile(
+    r"[『「\"']([^』」\"']{2,40})[』」\"']\s*(?:\((\d{4})\))?"
+)
+# "제목 (2024)" 패턴 (따옴표 없는 일반 형태). 보조 fallback.
+_TITLE_WITH_YEAR_PATTERN = re.compile(
+    r"([가-힣A-Za-z0-9:\-\s]{2,40})\s*\((\d{4})\)"
+)
+
+# ── 영화 제목 유효성 검증용 블랙리스트 (2026-04-23 후속 P1) ──
+# 정규식 패턴이 영화가 아닌 일반명사/제네릭 단어까지 잡는 false-positive 를 차단한다.
+# 배경: DuckDuckGo 결과에는 "「영화」" / "「최신 영화 추천」" 같이 일반 명사를 따옴표로
+# 감싼 표현이 흔히 포함돼 제목으로 오인식되는 경우가 있었다. 이 블랙리스트에 걸리면
+# 해당 결과는 드롭하고 다음 결과로 넘어간다.
+# 대소문자/공백 제거 후 키로 매칭한다.
+_GENERIC_TITLE_BLACKLIST: set[str] = {
+    "영화",
+    "최신영화",
+    "최근영화",
+    "올해영화",
+    "추천",
+    "영화추천",
+    "신작영화",
+    "개봉영화",
+    "ott",
+    "넷플릭스",
+    "상영중",
+    "박스오피스",
+    "영화관",
+    "예고편",
+    "트레일러",
+    "movie",
+    "film",
+    "trailer",
+    "latest",
+    "new",
+    "release",
+}
+
+# ── 연도 일치 허용 오차 (2026-04-23 후속 P1) ──
+# 사용자가 release_year_gte=2026 을 지정했는데 추출된 영화 연도가 2020 이면
+# "원하지 않는 영화를 보여주게 된다" → 오차 3 년 이내만 허용.
+# 보수적으로 낮게 잡으면 검색 결과가 과소되므로 경험적으로 ±3 년.
+_YEAR_MATCH_TOLERANCE = 3
+
+
+def _is_valid_movie_title(title: str) -> bool:
+    """
+    정규식으로 뽑은 제목이 실제 영화 제목일 가능성이 있는지 검증한다.
+
+    드롭 규칙:
+     1. 공백 제거 후 2 자 미만
+     2. `_GENERIC_TITLE_BLACKLIST` 에 포함 (대소문자/공백 제거 후)
+     3. 숫자/특수문자만 있는 경우 (예: "2026", "!!!")
+     4. 한글/영문자가 하나도 없는 경우
+
+    Args:
+        title: _extract_movie_candidates 가 추출한 후보 제목
+
+    Returns:
+        True 이면 유효한 영화 제목 후보
+    """
+    if not title:
+        return False
+
+    normalized = title.lower().replace(" ", "")
+    if len(normalized) < 2:
+        return False
+
+    if normalized in _GENERIC_TITLE_BLACKLIST:
+        return False
+
+    # 한글(가-힣) 또는 영문자(A-Za-z) 중 하나라도 있어야 영화 제목으로 간주
+    if not re.search(r"[가-힣A-Za-z]", title):
+        return False
+
+    return True
+
+
+def _is_year_compatible(
+    extracted_year: int,
+    release_year_gte: int | None,
+) -> bool:
+    """
+    추출된 영화의 연도가 사용자가 요청한 시기와 맞는지 판정한다.
+
+    release_year_gte 가 None 이면 판정 스킵(허용). extracted_year 가 0 이면
+    정규식이 연도를 잡지 못한 경우인데, 이 경우에도 드롭하지 않는다(제목은 유효할 수 있음).
+    둘 다 양의 정수일 때만 비교하며, `extracted_year >= release_year_gte - tolerance` 면 허용.
+
+    예) release_year_gte=2026, _YEAR_MATCH_TOLERANCE=3
+        extracted_year 2023 → 통과 (2026-3=2023)
+        extracted_year 2020 → 드롭
+        extracted_year 2028 → 통과 (하한만 검사, 미래는 허용)
+        extracted_year 0    → 통과 (연도 미상)
+
+    Args:
+        extracted_year: _extract_movie_candidates 가 뽑은 영화 개봉연도
+        release_year_gte: 사용자 요청 하한
+
+    Returns:
+        True 이면 release_year_gte 와 호환
+    """
+    if release_year_gte is None or release_year_gte <= 0:
+        return True
+    if extracted_year <= 0:
+        return True  # 연도 미상 → 제목 기반으로만 판단
+    return extracted_year >= release_year_gte - _YEAR_MATCH_TOLERANCE
+
+
+def _build_external_query(
+    user_intent: str,
+    current_input: str,
+    release_year_gte: int | None = None,
+) -> str:
+    """
+    external_search_node 가 사용하는 DuckDuckGo 쿼리를 구성한다.
+
+    사용자 의도(user_intent) 가 있으면 그것을 중심으로,
+    없으면 원문 입력을 fallback 으로 사용한다.
+    release_year_gte 가 지정되면 연도 키워드를 명시적으로 추가해
+    "최신 영화 2026 개봉 추천" 같은 형태로 질의 정확도를 올린다.
+
+    Args:
+        user_intent: preference_refiner 가 요약한 사용자 의도 문자열
+        current_input: 사용자가 실제로 입력한 원문
+        release_year_gte: dynamic_filters 에서 추출한 개봉연도 하한
+
+    Returns:
+        DuckDuckGo 검색 쿼리 문자열
+    """
+    base = (user_intent or current_input or "최신 영화 추천").strip()
+    parts = [base] if base else []
+
+    # 시기 신호가 있으면 연도를 쿼리에 직접 포함해 검색 정확도를 높인다.
+    if release_year_gte and release_year_gte > 0:
+        parts.append(f"{release_year_gte}년")
+
+    # DuckDuckGo 가 Wikipedia/나무위키 개봉작 목록 페이지를 우선 노출하도록 유도
+    parts.append("개봉 영화 추천 목록")
+
+    return " ".join(parts)
+
+
+def _extract_movie_candidates(
+    results: list[dict[str, str]],
+    max_movies: int = 5,
+    release_year_gte: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    DuckDuckGo 검색 결과 리스트에서 영화 제목·연도·overview 를 추출한다.
+
+    RankedMovie 로 변환 가능한 "스텁 dict" 리스트를 반환한다.
+    신뢰 도메인(KMDB/KOBIS/Wikipedia/namu.wiki) 결과에서 제목을 우선 뽑고,
+    동일 제목은 중복 제거한다.
+
+    실제 내부 DB 의 movie_id 를 부여할 수 없으므로 id 는 `external_{i}`
+    형태의 합성 ID 를 사용한다. Client/Backend 저장 경로에서 이 접두사로
+    "외부 소스" 여부를 구분할 수 있다.
+
+    2026-04-23 후속 P1: 오보강 방지를 위해 제목 유효성(_is_valid_movie_title)과
+    연도 호환성(_is_year_compatible) 검증을 추가. 일반명사/숫자만 있는 "영화" 같은
+    제네릭 제목과 사용자 요청 시기와 동떨어진 연도의 영화는 드롭된다.
+
+    Args:
+        results: _search_duckduckgo() 반환값
+        max_movies: 최대 추출 영화 수
+        release_year_gte: 사용자 요청 개봉연도 하한 (None 이면 연도 검증 스킵)
+
+    Returns:
+        영화 스텁 dict 리스트. 예:
+        [{"id": "external_0", "title": "인터스텔라", "release_year": 2014,
+          "overview": "...", "source_url": "...", "_external": True}, ...]
+    """
+    if not results:
+        return []
+
+    # 신뢰 도메인 우선 정렬 (모듈 상수 _PRIORITY_DOMAINS 재사용 — 단일 진실 원본)
+    def _priority(r: dict) -> int:
+        href = r.get("href", "")
+        for i, d in enumerate(_PRIORITY_DOMAINS):
+            if d in href:
+                return i
+        return len(_PRIORITY_DOMAINS)
+
+    sorted_results = sorted(results, key=_priority)
+
+    extracted: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+
+    for r in sorted_results:
+        title_field = r.get("title", "") or ""
+        body_field = r.get("body", "") or ""
+        href = r.get("href", "") or ""
+
+        # 1차: 검색결과 title 에서 따옴표로 감싼 영화 제목 추출
+        match = _TITLE_QUOTED_PATTERN.search(title_field) or \
+                _TITLE_QUOTED_PATTERN.search(body_field)
+
+        # 2차 fallback: "제목 (YYYY)" 형태
+        if not match:
+            match = _TITLE_WITH_YEAR_PATTERN.search(title_field) or \
+                    _TITLE_WITH_YEAR_PATTERN.search(body_field)
+
+        if match:
+            title = match.group(1).strip()
+            year_str = match.group(2) if match.lastindex and match.lastindex >= 2 else ""
+            release_year = int(year_str) if year_str and year_str.isdigit() else 0
+        else:
+            # 제목 추출 실패 → 검색결과 title 을 그대로 쓰되 너무 긴 경우 컷
+            title = title_field.split("-")[0].split("|")[0].strip()[:40]
+            release_year = 0
+
+        # ── 제목 유효성 검증 (P1) ──
+        # 블랙리스트/길이/문자종 검증 — 일반명사 false-positive 드롭
+        if not _is_valid_movie_title(title):
+            logger.debug("external_candidate_reject_invalid_title", title=title, href=href)
+            continue
+
+        # ── 연도 호환성 검증 (P1) ──
+        # release_year_gte 요청이 있는데 추출 연도가 3 년 이상 차이나면 드롭
+        if not _is_year_compatible(release_year, release_year_gte):
+            logger.debug(
+                "external_candidate_reject_year_mismatch",
+                title=title,
+                extracted_year=release_year,
+                requested_gte=release_year_gte,
+            )
+            continue
+
+        # 중복 제거 (동일 제목)
+        title_key = title.lower().replace(" ", "")
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        # overview: body 에서 HTML 제거 + 300자 컷
+        overview = _extract_useful_text(body_field)[:300]
+
+        extracted.append({
+            "id": f"external_{len(extracted)}",
+            "title": title,
+            "release_year": release_year,
+            "overview": overview,
+            "source_url": href,
+            "_external": True,
+        })
+
+        if len(extracted) >= max_movies:
+            break
+
+    return extracted
+
+
+async def search_external_movies(
+    user_intent: str,
+    current_input: str,
+    release_year_gte: int | None = None,
+    max_movies: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    DuckDuckGo 로 "DB 밖 신작 영화" 를 검색해 스텁 영화 dict 리스트를 반환한다.
+
+    external_search_node 에서 사용하는 최상위 유틸. 에러 시 빈 리스트 반환.
+
+    Args:
+        user_intent: 사용자 의도 요약 (preferences.user_intent)
+        current_input: 원문 입력
+        release_year_gte: 개봉연도 하한 (dynamic_filters 에서 추출)
+        max_movies: 최대 영화 수
+
+    Returns:
+        영화 스텁 dict 리스트 (RankedMovie 로 변환 가능)
+    """
+    query = _build_external_query(user_intent, current_input, release_year_gte)
+    logger.info(
+        "external_movie_search_start",
+        query=query,
+        user_intent=(user_intent or "")[:80],
+        release_year_gte=release_year_gte,
+    )
+
+    start = time.perf_counter()
+    results = await _search_duckduckgo(query)
+    # 연도 하한을 _extract_movie_candidates 로 전파하여 연도 미스매치 자동 드롭 (P1)
+    candidates = _extract_movie_candidates(
+        results,
+        max_movies=max_movies,
+        release_year_gte=release_year_gte,
+    )
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    logger.info(
+        "external_movie_search_done",
+        query=query,
+        raw_results=len(results),
+        extracted=len(candidates),
+        elapsed_ms=round(elapsed_ms, 1),
+    )
+    return candidates

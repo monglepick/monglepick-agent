@@ -37,8 +37,6 @@ from monglepick.prompts.question import (
     QUESTION_HUMAN_PROMPT,
     QUESTION_SYSTEM_PROMPT,
 )
-from monglepick.prompts.tool_executor import TOOL_EXECUTOR_SYSTEM_PROMPT
-
 __all__ = [
     # 페르소나
     "MONGGLE_SYSTEM_PROMPT",
@@ -65,6 +63,7 @@ __all__ = [
     # 의도+감정 통합
     "INTENT_EMOTION_SYSTEM_PROMPT",
     "INTENT_EMOTION_HUMAN_PROMPT",
-    # 도구 실행
-    "TOOL_EXECUTOR_SYSTEM_PROMPT",
+    # 도구 실행 — 2026-04-23 외부 지도 연동 라운드에서 stub 제거.
+    # tool_executor 가 LLM 미사용 규칙 기반(INTENT_TOOL_MAP → asyncio.gather)으로 전환되어
+    # 프롬프트가 불필요해졌고, 단일 진실 원본 원칙에 따라 export-only stub 도 정리했다.
 ]

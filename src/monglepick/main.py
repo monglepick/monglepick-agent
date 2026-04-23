@@ -24,6 +24,7 @@ from monglepick.utils.logging_config import configure_logging
 configure_logging()
 
 from monglepick.api.admin import admin_router
+from monglepick.api.admin_assistant import admin_assistant_router
 from monglepick.api.admin_data import admin_data_router
 from monglepick.api.chat import chat_router
 from monglepick.api.match import match_router
@@ -192,8 +193,10 @@ async def lifespan(app: FastAPI):
     shutdown_start = time.perf_counter()
     logger.info("app_shutdown")
     # httpx 클라이언트 정리 (C-2: 리소스 누수 방지)
+    from monglepick.api.admin_backend_client import close_admin_client
     from monglepick.api.point_client import close_client
     await close_client()
+    await close_admin_client()
     await close_all_clients()
     shutdown_elapsed_ms = (time.perf_counter() - shutdown_start) * 1000
     logger.info("app_shutdown_complete", elapsed_ms=round(shutdown_elapsed_ms, 1))
@@ -213,6 +216,14 @@ openapi_tags = [
     {
         "name": "system",
         "description": "서버 상태 확인용 시스템 엔드포인트.",
+    },
+    {
+        "name": "admin_assistant",
+        "description": (
+            "관리자 AI 어시스턴트 — 자연어로 관리자 기능(조회/CRUD/통계/보고서)을 구동. "
+            "Step 1(2026-04-23): Intent 분류 + smalltalk 응답만 구현. "
+            "query/action/stats/report 는 후속 Step 에서 Tool RAG 로 확장."
+        ),
     },
 ]
 
@@ -289,6 +300,12 @@ app.include_router(match_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
 # Phase 6 (2026-04-08): 데이터 관리 admin 라우터 등록 — 영화 CRUD + 파이프라인 SSE + 데이터 현황
 app.include_router(admin_data_router, prefix="/api/v1")
+# 관리자 AI 어시스턴트 (2026-04-23, Step 1):
+# 자연어로 관리자 기능(조회/CRUD/통계/보고서)을 구동하는 LangGraph 에이전트.
+# 현재는 Intent 분류 + smalltalk 응답만 구현되어 있고, query/action/stats/report 는
+# 후속 Step 에서 Tool RAG + tool-calling 으로 확장된다.
+# 설계서: docs/관리자_AI에이전트_설계서.md (v2.0)
+app.include_router(admin_assistant_router, prefix="/api/v1")
 
 # ── Prometheus 메트릭 엔드포인트 ──
 # prometheus-fastapi-instrumentator 가 /metrics 경로에 자동으로

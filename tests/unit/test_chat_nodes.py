@@ -840,31 +840,55 @@ class TestGeneralResponder:
 # ============================================================
 
 class TestToolExecutorNode:
-    """tool_executor_node 노드 테스트 (Phase 6 스텁)."""
+    """tool_executor_node 노드 — 스모크 테스트 (외부 지도 연동 라운드 이후 실구현으로 교체).
+
+    상세 행동(geocoding 흐름·도구 dispatch·메시지 포맷)은 test_tool_executor_node.py
+    참조. 본 클래스는 회귀 방지용 minimal smoke 만 유지한다.
+    """
 
     @pytest.mark.asyncio
-    async def test_info_intent(self):
-        """info 의도 → 안내 메시지."""
+    async def test_info_intent_runs_without_error(self):
+        """info 의도 → 도구가 다 skip 되어도 fallback 응답이 반환된다."""
+        from unittest.mock import AsyncMock, patch
         state: ChatAgentState = {
             "intent": IntentResult(intent="info", confidence=0.9),
+            "current_input": "기생충 알려줘",
         }
-        result = await tool_executor_node(state)
-        assert "준비" in result["response"]
+        # execute_tool 을 mock 처리해 외부 API 의존성 차단
+        with patch(
+            "monglepick.agents.chat.nodes.execute_tool",
+            new=AsyncMock(return_value={}),
+        ):
+            result = await tool_executor_node(state)
+        assert "response" in result
+        assert isinstance(result["response"], str)
+        assert len(result["response"]) > 0
 
     @pytest.mark.asyncio
-    async def test_theater_intent(self):
-        """theater 의도 → 안내 메시지."""
+    async def test_theater_intent_without_location_asks_for_location(self):
+        """theater 의도 + location 없음 + 지명 없음 → 위치 재질의."""
         state: ChatAgentState = {
             "intent": IntentResult(intent="theater", confidence=0.8),
+            "current_input": "영화관 알려줘",
         }
         result = await tool_executor_node(state)
-        assert "영화관" in result["response"]
+        # 도구를 호출조차 안 했으므로 tool_results 키는 없다
+        assert "tool_results" not in result
+        # 위치 재질의 안내 (이모지 또는 키워드)
+        assert "지하철역" in result["response"] or "동네" in result["response"]
 
     @pytest.mark.asyncio
-    async def test_booking_intent(self):
-        """booking 의도 → 안내 메시지."""
+    async def test_booking_intent_returns_response(self):
+        """booking 의도 → execute_tool 빈 결과여도 fallback 응답."""
+        from unittest.mock import AsyncMock, patch
         state: ChatAgentState = {
             "intent": IntentResult(intent="booking", confidence=0.7),
+            "current_input": "기생충 예매하고 싶어",
         }
-        result = await tool_executor_node(state)
-        assert "예매" in result["response"]
+        with patch(
+            "monglepick.agents.chat.nodes.execute_tool",
+            new=AsyncMock(return_value={}),
+        ):
+            result = await tool_executor_node(state)
+        assert "response" in result
+        assert isinstance(result["response"], str)

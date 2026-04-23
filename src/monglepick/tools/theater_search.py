@@ -12,14 +12,21 @@ theater 의도 처리 시 tool_executor_node에서 호출된다.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import httpx
 import structlog
 from langchain_core.tools import tool
 
 from monglepick.config import settings
+from monglepick.metrics import (
+    external_map_tool_duration_seconds,
+    external_map_tool_total,
+)
 
 logger = structlog.get_logger()
+
+_TOOL_NAME = "theater_search"
 
 # 카카오 로컬 API 설정
 _KAKAO_API_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
@@ -32,6 +39,42 @@ _THEATER_KEYWORDS = ["CGV", "롯데시네마", "메가박스"]
 
 # 검색 반경 최대값 (미터) — 카카오 API 최대 20,000m
 _MAX_RADIUS_M = 20_000
+
+# 영화관 체인 식별 + 모바일 예매 페이지 검색 딥링크 패턴
+# 영화관별 시간표 API 가 공식 공개되지 않아 체인 검색 페이지로 점프시키고
+# 사용자가 영화관명으로 다시 한 번 선택하도록 유도한다 (스크래핑 회피).
+# 키 = 식별 토큰(소문자), 값 = (chain_label, booking_url_template)
+# booking_url_template 의 {q} 자리에 영화관명을 URL 인코딩하여 삽입한다.
+_CHAIN_PATTERNS: list[tuple[str, str, str]] = [
+    # (식별 토큰, chain 라벨, booking URL 템플릿)
+    ("cgv",     "CGV",      "https://m.cgv.co.kr/cgvsearch/Search.aspx?query={q}"),
+    ("롯데",    "롯데시네마", "https://www.lottecinema.co.kr/NLCHS/Cinema/Detail?cinemaQuery={q}"),
+    ("메가박스", "메가박스",  "https://www.megabox.co.kr/theater?searchKeyword={q}"),
+]
+
+
+def _detect_chain_and_booking_url(name: str) -> tuple[str, str]:
+    """
+    영화관명에서 체인을 식별하고 해당 체인의 모바일 검색 딥링크를 생성한다.
+
+    예: "CGV 강남" → ("CGV", "https://m.cgv.co.kr/cgvsearch/Search.aspx?query=CGV%20%EA%B0%95%EB%82%A8")
+
+    매칭 실패 시 ("기타", "") 반환 — 비체인 상영관(예: 독립영화관) 대응.
+
+    Args:
+        name: 카카오 응답의 place_name (예: "CGV 강남", "롯데시네마 월드타워")
+
+    Returns:
+        (chain_label, booking_url) — 매칭 실패 시 ("기타", "")
+    """
+    # urllib import 는 모듈 상단 의존을 줄이기 위해 함수 레벨에서 지연 로드
+    from urllib.parse import quote
+
+    lowered = name.lower()
+    for token, chain_label, url_template in _CHAIN_PATTERNS:
+        if token in lowered:
+            return chain_label, url_template.format(q=quote(name))
+    return "기타", ""
 
 
 @tool
@@ -69,10 +112,12 @@ async def theater_search(
     # API 키 누락 시 조기 반환
     if not _KAKAO_API_KEY:
         logger.warning("theater_search_tool_no_api_key")
+        external_map_tool_total.labels(tool=_TOOL_NAME, outcome="no_api_key").inc()
         return "영화관 검색이 잠시 안 돼요"
 
     # 반경 범위 보정 (최소 100m, 최대 20,000m)
     safe_radius = max(100, min(int(radius), _MAX_RADIUS_M))
+    started = time.perf_counter()
 
     try:
         # 공통 요청 헤더 (카카오 REST API 인증)
@@ -115,6 +160,12 @@ async def theater_search(
             result_count=len(merged),
             top_names=[t.get("name", "") for t in merged[:3]],
         )
+        # 결과 0건은 "정상 응답이지만 매칭 0건" 으로 empty 라벨, 아니면 ok.
+        outcome = "ok" if merged else "empty"
+        external_map_tool_total.labels(tool=_TOOL_NAME, outcome=outcome).inc()
+        external_map_tool_duration_seconds.labels(tool=_TOOL_NAME).observe(
+            time.perf_counter() - started
+        )
         return merged
 
     except httpx.TimeoutException:
@@ -123,6 +174,10 @@ async def theater_search(
             latitude=latitude,
             longitude=longitude,
             timeout_sec=_KAKAO_TIMEOUT_SEC,
+        )
+        external_map_tool_total.labels(tool=_TOOL_NAME, outcome="timeout").inc()
+        external_map_tool_duration_seconds.labels(tool=_TOOL_NAME).observe(
+            time.perf_counter() - started
         )
         return "영화관 검색이 잠시 안 돼요"
 
@@ -134,6 +189,10 @@ async def theater_search(
             error_type=type(e).__name__,
             latitude=latitude,
             longitude=longitude,
+        )
+        external_map_tool_total.labels(tool=_TOOL_NAME, outcome="exception").inc()
+        external_map_tool_duration_seconds.labels(tool=_TOOL_NAME).observe(
+            time.perf_counter() - started
         )
         return "영화관 검색이 잠시 안 돼요"
 
@@ -183,9 +242,12 @@ async def _search_keyword(
         theaters: list[dict] = []
         for doc in data.get("documents", []):
             # 카카오 응답 필드: id, place_name, road_address_name, phone, x(경도), y(위도), distance
+            place_name = doc.get("place_name", "")
+            chain_label, booking_url = _detect_chain_and_booking_url(place_name)
             theaters.append({
                 "theater_id": doc.get("id", ""),
-                "name": doc.get("place_name", ""),
+                "name": place_name,
+                "chain": chain_label,                # "CGV" / "롯데시네마" / "메가박스" / "기타"
                 "address": doc.get("road_address_name") or doc.get("address_name", ""),
                 "phone": doc.get("phone", ""),
                 "latitude": float(doc.get("y", 0)),
@@ -193,6 +255,9 @@ async def _search_keyword(
                 # distance: 카카오 API가 문자열로 반환 ("1234")
                 "distance_m": int(doc.get("distance", 0) or 0),
                 "place_url": doc.get("place_url", ""),
+                # 체인 모바일 사이트 검색 딥링크 — 영화관별 시간표 API 가 없어
+                # 사용자가 한 번 더 영화관을 클릭해야 하는 한계는 있지만 스크래핑 회피.
+                "booking_url": booking_url,
             })
         return theaters
 

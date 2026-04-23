@@ -10,12 +10,17 @@ from fastapi import APIRouter
 
 from monglepick.api.content import content_router
 from monglepick.api.roadmap import roadmap_router
+from monglepick.api.support import support_router
 
 api_router = APIRouter(tags=["system"])
 
 # ── Phase 7: 콘텐츠 분석 + 로드맵 에이전트 라우터 등록 ──
 api_router.include_router(content_router)
 api_router.include_router(roadmap_router)
+
+# ── 2026-04-23: 고객센터 AI 챗봇(support_assistant) 라우터 등록 ──
+# POST /api/v1/support/chat (SSE) + /support/chat/sync (debug)
+api_router.include_router(support_router)
 
 
 @api_router.get(

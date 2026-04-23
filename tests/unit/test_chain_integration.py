@@ -195,15 +195,17 @@ async def test_all_chains_error_resilience(mock_ollama):
 
 
 # ============================================================
-# 시나리오 7: Tool Executor NotImplementedError
+# 시나리오 7: Tool Executor — 실구현 (외부 지도 연동 라운드에서 stub 제거됨)
 # ============================================================
 
 
 @pytest.mark.asyncio
-async def test_tool_executor_not_implemented():
-    """tool_executor_chain은 NotImplementedError를 발생시킨다."""
-    with pytest.raises(NotImplementedError, match="Phase 6"):
-        await execute_tool("info", "인터스텔라 정보 알려줘")
+async def test_tool_executor_unknown_intent_returns_empty():
+    """알 수 없는 intent → 빈 dict (NotImplementedError 발생 X)."""
+    # Phase 6 외부 지도 연동 라운드 이전: NotImplementedError 를 throw 하는 stub 이었으나
+    # 이제 실제 디스패처로 교체되었다 — 알 수 없는 intent 는 silently 빈 dict 반환.
+    result = await execute_tool("nonexistent_intent")
+    assert result == {}
 
 
 # ============================================================
@@ -235,7 +237,12 @@ def test_chains_module_imports():
 
 
 def test_prompts_module_imports():
-    """prompts/__init__.py에서 모든 프롬프트를 import할 수 있다."""
+    """prompts/__init__.py에서 모든 프롬프트를 import할 수 있다.
+
+    2026-04-23 외부 지도 연동 라운드에서 `TOOL_EXECUTOR_SYSTEM_PROMPT` 는 제거됐다.
+    tool_executor 가 LLM 미사용 규칙 기반 디스패처로 전환되어 프롬프트가 불필요해졌고,
+    단일 진실 원본 원칙에 따라 export-only stub 도 함께 정리했다.
+    """
     from monglepick.prompts import (
         EMOTION_HUMAN_PROMPT,
         EMOTION_SYSTEM_PROMPT,
@@ -250,7 +257,6 @@ def test_prompts_module_imports():
         PREFERENCE_SYSTEM_PROMPT,
         QUESTION_HUMAN_PROMPT,
         QUESTION_SYSTEM_PROMPT,
-        TOOL_EXECUTOR_SYSTEM_PROMPT,
     )
     # 모든 프롬프트가 비어있지 않은 문자열
     assert len(MONGGLE_SYSTEM_PROMPT) > 0
@@ -260,7 +266,10 @@ def test_prompts_module_imports():
     assert len(PREFERENCE_SYSTEM_PROMPT) > 0
     assert len(QUESTION_SYSTEM_PROMPT) > 0
     assert len(EXPLANATION_SYSTEM_PROMPT) > 0
-    assert len(TOOL_EXECUTOR_SYSTEM_PROMPT) > 0
+    # EMOTION_HUMAN_PROMPT / EMOTION_TO_MOOD_MAP / EXPLANATION_HUMAN_PROMPT /
+    # INTENT_HUMAN_PROMPT / PREFERENCE_HUMAN_PROMPT / QUESTION_HUMAN_PROMPT /
+    # MONGGLE_RECOMMENDATION_PERSONA 는 import 자체가 검증 (NameError 방지).
+    assert EMOTION_TO_MOOD_MAP is not None
 
 
 def test_llm_module_imports():
