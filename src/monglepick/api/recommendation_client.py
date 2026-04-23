@@ -52,8 +52,16 @@ def _movie_to_item(movie: Any) -> dict[str, Any]:
         else 0.0
     )
 
+    # 2026-04-23 후속: id 접두사 "external_" 이면 EXTERNAL_DDGS, 그 외 INTERNAL.
+    # external_search_node 가 생성한 RankedMovie 스텁은 DB Movie FK 가 존재하지 않아
+    # Backend Service 의 existsById pre-check 에서 skip 되지만, 혹시 외부 검색 결과와
+    # 동일한 movieId 가 내부 DB 에도 우연히 존재하는 경우에는 저장이 진행되므로
+    # sourceType 을 정확히 라벨링해 둬야 관리자 분석에서 경로별 비율 추적이 가능하다.
+    movie_id = d.get("id", "") or ""
+    source_type = "EXTERNAL_DDGS" if movie_id.startswith("external_") else "INTERNAL"
+
     return {
-        "movieId": d.get("id", ""),
+        "movieId": movie_id,
         "rankPosition": d.get("rank", 0),
         "reason": explanation if explanation else " ",
         "score": final_score,
@@ -62,6 +70,7 @@ def _movie_to_item(movie: Any) -> dict[str, Any]:
         "hybridScore": score_detail.get("hybrid_score"),
         "genreMatch": score_detail.get("genre_match"),
         "moodMatch": score_detail.get("mood_match"),
+        "sourceType": source_type,
     }
 
 

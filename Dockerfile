@@ -27,9 +27,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# curl 설치 (헬스체크용)
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# curl: 헬스체크용
+# tzdata: Asia/Seoul 시간대 지원 (QA #162/#177 근본 해결). debian-slim 은 tzdata 미포함 상태로
+#   `datetime.now()` 가 UTC 로 떨어진다. tzdata 설치 + /etc/localtime 심볼릭 링크로 확실히 고정.
+RUN apt-get update && apt-get install -y --no-install-recommends curl tzdata \
+    && ln -snf /usr/share/zoneinfo/Asia/Seoul /etc/localtime \
+    && echo "Asia/Seoul" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
+
+# 기본 타임존 — docker-compose 에서 TZ 로 오버라이드 가능.
+ENV TZ=Asia/Seoul
 
 # 빌드 단계에서 생성된 가상환경 복사
 COPY --from=builder /app/.venv /app/.venv

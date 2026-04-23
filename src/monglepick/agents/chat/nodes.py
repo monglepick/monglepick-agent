@@ -48,6 +48,7 @@ from monglepick.agents.chat.models import (
     FilterCondition,
     ImageAnalysisResult,
     IntentResult,
+    Location,
     RankedMovie,
     ScoreDetail,
     SearchQuery,
@@ -57,16 +58,22 @@ from monglepick.agents.chat.models import (
 from monglepick.chains import (
     analyze_image,
     classify_intent_and_emotion,
+    execute_tool,
     extract_preferences,
     generate_clarification,
     generate_explanations_batch,
     generate_general_response,
     generate_question,
 )
+from monglepick.tools.geocoding import geocoding
 from monglepick.chains.question_chain import _get_missing_fields
 from monglepick.db.clients import ES_INDEX_NAME, get_elasticsearch, get_mysql
+from monglepick.metrics import external_map_location_source_total
 from monglepick.rag.hybrid_search import SearchResult, hybrid_search
-from monglepick.utils.movie_info_enricher import enrich_movies_batch
+from monglepick.utils.movie_info_enricher import (
+    enrich_movies_batch,
+    search_external_movies,
+)
 
 logger = structlog.get_logger()
 
@@ -1709,6 +1716,169 @@ async def similar_fallback_search(state: ChatAgentState) -> dict:
 
 
 # ============================================================
+# 7.65. external_search_node — DB 후보 0건 & 최신 시그널 존재 시 외부 웹 검색
+# ============================================================
+#
+# 언제 호출되나?
+#   route_after_retrieval() 가 num_candidates==0 AND preferences.dynamic_filters 의
+#   release_year 하한이 (current_year - 1) 이상인 경우에만 이 노드로 분기한다.
+#   (graph.py:_has_recency_signal() 참조)
+#
+# 왜 필요한가?
+#   내부 DB(Qdrant/ES/Neo4j) 는 "수집 시점 기준" 영화만 가진다. 사용자가
+#   "2026년 개봉 영화" / "올해 나온 영화" 같은 시기 질의를 던졌을 때 DB 에
+#   해당 후보가 0 건이면 기존에는 question_generator 로 보내 재질문만 반복
+#   했다. 실제 신작 정보는 Wikipedia/나무위키 등에 이미 있으므로 DuckDuckGo
+#   웹 검색으로 보강해 "DB 외" 카드로라도 응답한다.
+#
+# 출력 계약:
+#   - candidate_movies 는 건드리지 않는다. (recommendation_ranker 를 건너뛰므로
+#     CF/CBF 점수 계산이 불가능하고, 0 건이면 ranker 가 바로 빈 리스트 반환한다.)
+#   - ranked_movies 에 RankedMovie 스텁을 직접 채워 넣는다.
+#     * id = "external_{i}" 접두사로 외부 출처 구분 가능
+#     * score_detail.hybrid_score = 0.0 (정렬 기준 없음 — 웹 검색 순서 유지)
+#     * explanation = "DB 외 외부 웹 검색 결과" 고정 문구
+#   - 그래프 엣지는 external_search_node → response_formatter (직결) 로,
+#     explanation_generator 의 enrich_movies_batch() 로 다시 검색하지 않는다
+#     (이미 외부 검색 결과를 담고 있음).
+# ============================================================
+
+@traceable(name="external_search_node", run_type="retriever", metadata={"node": "7.65/17"})
+async def external_search_node(state: ChatAgentState) -> dict:
+    """
+    DB 후보 0건 + 최신 시그널 있을 때 DuckDuckGo 로 외부 영화 정보를 검색한다.
+
+    preferences 에서 dynamic_filters[release_year>=N] 의 하한값을 뽑아
+    search_external_movies() 로 웹 검색하고, 결과를 RankedMovie 스텁으로
+    변환해 ranked_movies 에 직접 담는다. 이후 그래프는 recommendation_ranker /
+    explanation_generator 를 모두 건너뛰고 response_formatter 로 직행한다.
+
+    에러·타임아웃·결과 0 건 모두 ranked_movies=[] 로 graceful degrade 되어
+    response_formatter 의 "조건에 맞는 영화를 찾지 못했어요" 안내가 나온다.
+
+    Args:
+        state: ChatAgentState (preferences, current_input, session_id)
+
+    Returns:
+        dict: ranked_movies (list[RankedMovie] 스텁) 업데이트
+    """
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    user_id = state.get("user_id", "")
+
+    try:
+        preferences: ExtractedPreferences | None = state.get("preferences")
+        current_input = state.get("current_input", "")
+
+        # ── 1. release_year 하한값 추출 (dynamic_filters 우선) ──
+        release_year_gte: int | None = None
+        user_intent = ""
+        if preferences:
+            user_intent = preferences.user_intent or ""
+            for fc in preferences.dynamic_filters:
+                if fc.field == "release_year" and fc.operator == "gte":
+                    try:
+                        release_year_gte = int(fc.value)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+
+        # ── 2. DuckDuckGo 외부 검색 실행 ──
+        external_movies = await search_external_movies(
+            user_intent=user_intent,
+            current_input=current_input,
+            release_year_gte=release_year_gte,
+            max_movies=5,
+        )
+
+        if not external_movies:
+            elapsed_ms = (time.perf_counter() - node_start) * 1000
+            logger.info(
+                "external_search_no_results",
+                release_year_gte=release_year_gte,
+                user_intent=user_intent[:80],
+                elapsed_ms=round(elapsed_ms, 1),
+                session_id=session_id,
+                user_id=user_id,
+            )
+            return {"ranked_movies": []}
+
+        # ── 3. 외부 영화 스텁 → RankedMovie 변환 ──
+        # 주의: 내부 DB PK 가 아니므로 recommendation_log 저장 경로는 건너뛴다.
+        # Client 는 id 접두사 "external_" 로 이 카드를 "DB 외 정보" 로 표시해야 한다.
+        ranked: list[RankedMovie] = []
+        for i, m in enumerate(external_movies):
+            overview_text = m.get("overview", "") or ""
+            source_url = m.get("source_url", "") or ""
+
+            # 출처 URL 을 overview 뒤에 부착해 Client 가 "더 보기" 링크로 활용 가능
+            enriched_overview = overview_text
+            if source_url:
+                enriched_overview = (
+                    f"{overview_text}\n[외부 출처] {source_url}"
+                    if overview_text
+                    else f"[외부 출처] {source_url}"
+                )
+
+            ranked.append(RankedMovie(
+                id=m.get("id", f"external_{i}"),
+                title=m.get("title", "") or "",
+                title_en="",
+                genres=[],
+                director="",
+                cast=[],
+                rating=0.0,
+                release_year=int(m.get("release_year") or 0),
+                overview=enriched_overview,
+                mood_tags=[],
+                poster_path="",
+                ott_platforms=[],
+                certification="",
+                trailer_url="",
+                rank=i + 1,
+                score_detail=ScoreDetail(
+                    cf_score=0.0,
+                    cbf_score=0.0,
+                    hybrid_score=0.0,
+                    genre_match=0.0,
+                    mood_match=0.0,
+                    similar_to=[],
+                ),
+                # 고정 문구: response_formatter 의 몽글이 LLM 이 이 설명을 보고
+                # "최신 정보라 DB 에는 없지만 웹에서 찾아왔어요" 풍으로 자연스럽게 변환.
+                explanation="DB 에 없는 최신 영화 정보를 외부 웹에서 찾아왔어요.",
+                recommendation_log_id=None,
+            ))
+
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "external_search_node_completed",
+            release_year_gte=release_year_gte,
+            user_intent=user_intent[:80],
+            ranked_count=len(ranked),
+            ranked_titles=[m.title for m in ranked],
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+            user_id=user_id,
+        )
+        return {"ranked_movies": ranked}
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "external_search_node_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+            user_id=user_id,
+        )
+        # 에러 시 빈 ranked_movies 반환 → response_formatter 가 친절한 fallback 응답
+        return {"ranked_movies": []}
+
+
+# ============================================================
 # 7.7. llm_reranker — LLM 기반 후처리 재랭킹 (Phase Q)
 # ============================================================
 
@@ -2096,7 +2266,7 @@ async def response_formatter(state: ChatAgentState) -> dict:
         response = re.sub(r"^#{1,6}\s+", "", response, flags=re.MULTILINE)  # ## 제목 → 제목
         response = re.sub(r"^[-*]\s+", "", response, flags=re.MULTILINE)    # - 목록 → 목록
 
-        # assistant 메시지 추가 (timestamp + movies 포함 — 이전 대화 복원 시 영화 카드도 표시)
+        # assistant 메시지 추가 (timestamp + movies + 외부 지도 결과 포함 — 이전 대화 복원 시 카드/지도 모두 복원)
         assistant_msg: dict = {
             "role": "assistant",
             "content": response,
@@ -2110,6 +2280,33 @@ async def response_formatter(state: ChatAgentState) -> dict:
                 ]
             except Exception:
                 pass  # 직렬화 실패 시 movies 제외 (안전 처리)
+
+        # 외부 지도 연동 결과(영화관 + 박스오피스 + 사용자 위치)도 메시지에 포함:
+        # 이전 채팅 복원 시 TheaterCard / NowShowingPanel / 미니맵 사용자 마커 모두 복원되도록.
+        # tool_results 는 tool_executor_node 가 채워둔 dict (없으면 빈 dict).
+        tool_results = state.get("tool_results") or {}
+        if tool_results:
+            try:
+                theaters = tool_results.get("theater_search")
+                if isinstance(theaters, list) and theaters:
+                    assistant_msg["theaters"] = theaters
+                now_showing = tool_results.get("kobis_now_showing")
+                if isinstance(now_showing, list) and now_showing:
+                    assistant_msg["nowShowing"] = now_showing
+                # state.location 은 Pydantic Location 또는 dict — 둘 다 직렬화
+                loc = state.get("location")
+                if loc is not None:
+                    if hasattr(loc, "model_dump"):
+                        assistant_msg["userLocation"] = loc.model_dump()
+                    elif isinstance(loc, dict):
+                        assistant_msg["userLocation"] = loc
+            except Exception:
+                # 외부 지도 결과 직렬화 실패는 graceful — 다른 필드는 살린다.
+                logger.warning(
+                    "response_formatter_external_map_serialize_failed",
+                    session_id=session_id,
+                )
+
         messages.append(assistant_msg)
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
@@ -2251,61 +2448,279 @@ async def general_responder(state: ChatAgentState) -> dict:
 
 
 # ============================================================
-# 13. tool_executor_node — 도구 실행 (Phase 6 스텁)
+# 13. tool_executor_node — 도구 실행 (Phase 6 외부 지도 연동)
 # ============================================================
+
+# 사용자 메시지에서 위치 후보 토큰을 뽑아낼 때 쓰는 휴리스틱.
+# "강남역 근처 영화관" → "강남역" / "홍대 입구 영화관 알려줘" → "홍대 입구"
+# 카카오 keyword fallback 이 충분히 강건하므로 정확한 NER 까진 필요 없다.
+_LOCATION_HINT_PATTERNS: list[re.Pattern] = [
+    # "○○역" 으로 끝나는 지하철역 토큰 (예: 강남역, 홍대입구역)
+    re.compile(r"([가-힣A-Za-z0-9]+역)"),
+    # 행정구역/지명 + "근처/주변/근방" 앞부분 (예: "강남 근처", "신촌 주변")
+    re.compile(r"([가-힣A-Za-z0-9]{2,15})\s*(?:근처|근방|주변|인근)"),
+    # "○○동/○○구" 행정구역 — "○○시" 는 "서울시" 같이 너무 광역이라 카카오 검색 정확도 떨어져 제외.
+    # 시 단위 검색이 필요하면 사용자가 "강남" 처럼 더 좁은 토큰을 보내거나 좌표를 직접 보내면 된다.
+    re.compile(r"([가-힣A-Za-z0-9]+(?:동|구))"),
+]
+
+
+def _extract_location_hint(text: str) -> str | None:
+    """
+    사용자 자연어에서 위치 후보 토큰을 추출한다 (geocoding 도구 입력용).
+
+    완벽한 NER 가 아니라 카카오 키워드 검색이 매칭해줄 만한 "지명스러운 한 덩어리" 만
+    뽑아내면 충분하다. 매칭 실패 시 None.
+
+    Args:
+        text: 사용자 입력 (예: "강남역 근처 영화관 알려줘")
+
+    Returns:
+        매칭된 첫 토큰 (예: "강남역") 또는 None
+    """
+    if not text:
+        return None
+    for pattern in _LOCATION_HINT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            hint = match.group(1).strip()
+            if hint:
+                return hint
+    return None
+
+
+def _resolve_movie_id_from_state(state: ChatAgentState) -> str | None:
+    """
+    info/booking 의도에서 사용할 movie_id 를 state 에서 회수한다.
+
+    우선순위:
+    1) ranked_movies[0].id — 직전 추천 결과의 1순위
+    2) candidate_movies[0].id — 검색 결과 1순위
+    """
+    ranked = state.get("ranked_movies") or []
+    if ranked:
+        first = ranked[0]
+        rid = getattr(first, "id", None)
+        if rid:
+            return str(rid)
+    candidates = state.get("candidate_movies") or []
+    if candidates:
+        first = candidates[0]
+        cid = getattr(first, "id", None)
+        if cid:
+            return str(cid)
+    return None
+
+
+def _format_tool_response(
+    intent: str,
+    tool_results: dict[str, Any],
+    location_address: str | None,
+) -> str:
+    """
+    도구 실행 결과를 사용자 친화적 한국어 응답으로 정리한다 (LLM 미사용 — 템플릿).
+
+    영화관 카드 / 박스오피스 카드는 SSE event 로 별도 전송될 예정이므로,
+    여기서는 헤더 한 줄 + 항목 요약만 만든다. response_formatter 가 이 문자열을
+    SSE token 이벤트로 흘려보낸다.
+
+    Args:
+        intent: 사용자 의도
+        tool_results: execute_tool 반환값 (도구 이름 → 결과)
+        location_address: 사용자 위치 (자연어 헤더에 포함)
+
+    Returns:
+        사용자에게 보여줄 정리된 텍스트
+    """
+    parts: list[str] = []
+
+    # ── theater 의도: 영화관 N곳 + 현재 박스오피스 Top-N ──
+    if intent in ("theater", "booking"):
+        theaters = tool_results.get("theater_search")
+        if isinstance(theaters, list) and theaters:
+            head = f"{location_address} 근처" if location_address else "근처"
+            parts.append(f"{head}에서 가까운 영화관 {len(theaters)}곳을 찾았어요.")
+            # 상위 3곳만 텍스트 요약 — 나머지는 카드로 노출
+            for t in theaters[:3]:
+                distance = t.get("distance_m", 0)
+                distance_text = f"{distance}m" if distance < 1000 else f"{distance / 1000:.1f}km"
+                parts.append(f"• {t.get('name', '')} ({distance_text})")
+        elif isinstance(theaters, str):
+            # 도구가 안내 문자열을 직접 반환 (API 키 누락/타임아웃)
+            parts.append(theaters)
+
+        now_showing = tool_results.get("kobis_now_showing")
+        if isinstance(now_showing, list) and now_showing:
+            top_titles = [m.get("movie_nm", "") for m in now_showing[:5]]
+            parts.append("")
+            parts.append("지금 박스오피스 상위 영화: " + " / ".join(top_titles))
+
+    # ── info 의도: 영화 상세 + OTT + 유사 영화 ──
+    elif intent == "info":
+        detail = tool_results.get("movie_detail")
+        if isinstance(detail, dict) and detail.get("title"):
+            title = detail.get("title", "")
+            director = detail.get("director", "")
+            runtime = detail.get("runtime", 0)
+            head = f"'{title}'"
+            if director:
+                head += f" · 감독 {director}"
+            if runtime:
+                head += f" · {runtime}분"
+            parts.append(head)
+            overview = detail.get("overview", "")
+            if overview:
+                parts.append(overview[:200] + ("..." if len(overview) > 200 else ""))
+        elif isinstance(detail, str):
+            parts.append(detail)
+
+        ott = tool_results.get("ott_availability")
+        if isinstance(ott, list) and ott:
+            parts.append("OTT: " + ", ".join(str(p) for p in ott[:5]))
+
+        similar = tool_results.get("similar_movies")
+        if isinstance(similar, list) and similar:
+            sim_titles = [s.get("title", "") for s in similar[:3] if isinstance(s, dict)]
+            if sim_titles:
+                parts.append("비슷한 영화: " + " / ".join(sim_titles))
+
+    if not parts:
+        # 어떤 도구도 의미있는 결과를 못 줬을 때 — 솔직하게 안내
+        return "관련 정보를 가져오지 못했어요. 잠시 후 다시 시도해주시거나, 영화 추천이 필요하면 말씀해주세요! 🎬"
+    return "\n".join(parts)
+
 
 @traceable(name="tool_executor_node", run_type="tool", metadata={"node": "13/13"})
 async def tool_executor_node(state: ChatAgentState) -> dict:
     """
-    도구 실행 노드 (Phase 6 스텁).
+    외부 도구 실행 노드 (Phase 6 외부 지도 연동).
 
-    info/theater/booking 의도에 대해 아직 구현되지 않은 기능임을 안내한다.
-    NotImplementedError를 호출하지 않고, 친절한 안내 메시지를 반환한다.
+    처리 흐름:
+    1) intent 확인 (info/theater/booking 만 처리)
+    2) theater/booking 인데 location 미제공 → 메시지에서 지명 추출 → geocoding 으로 좌표 변환
+       · 지명도 못 뽑으면 위치 재질의 안내 응답
+    3) chains.execute_tool() 로 INTENT_TOOL_MAP 의 도구들을 병렬 실행
+    4) 결과 dict 를 state.tool_results 에 저장 + _format_tool_response 로 자연어 응답 생성
+    5) response_formatter 가 tool_results 를 SSE event 로 분기 송출 (별도 PR)
 
     Args:
-        state: ChatAgentState (intent 필요)
+        state: ChatAgentState (intent, location?, current_input, ranked/candidate_movies?)
 
     Returns:
-        dict: response 업데이트
+        dict: tool_results, location?, response 업데이트
     """
-    # 노드 실행 타이밍 측정 시작
     node_start = time.perf_counter()
     session_id = state.get("session_id", "")
     user_id = state.get("user_id", "")
     try:
-        intent = state.get("intent")
-        intent_str = intent.intent if intent else "unknown"
+        intent_obj = state.get("intent")
+        intent_str = intent_obj.intent if intent_obj else "unknown"
+        current_input = state.get("current_input", "")
 
-        # 의도별 안내 메시지
-        messages_map = {
-            "info": "영화 상세 정보 조회 기능은 곧 준비될 예정이에요! 🎬 "
-                    "궁금한 영화가 있으시면 제목을 알려주세요, 아는 범위에서 추천해드릴게요!",
-            "theater": "가까운 영화관 검색 기능은 아직 준비 중이에요! 🏢 "
-                       "대신 보고 싶은 영화를 추천해드릴까요?",
-            "booking": "예매 링크 연결 기능은 아직 준비 중이에요! 🎟️ "
-                       "대신 보고 싶은 영화를 추천해드릴까요?",
-        }
-        response = messages_map.get(
-            intent_str,
-            "해당 기능은 아직 준비 중이에요. 영화 추천이 필요하시면 말씀해주세요! 🎬",
+        # info/theater/booking 외 의도는 본 노드에서 처리하지 않는다 (라우팅 안전망)
+        if intent_str not in ("info", "theater", "booking"):
+            logger.info("tool_executor_node_unsupported_intent", intent=intent_str)
+            return {"response": "영화 추천이 필요하시면 말씀해주세요! 🎬"}
+
+        # ── 위치 해소 (theater/booking 만 해당) ──
+        location: Location | None = state.get("location")
+        location_dict: dict | None = None
+        if intent_str in ("theater", "booking"):
+            if location:
+                # Client 가 이미 좌표를 보냈음
+                location_dict = {
+                    "latitude": location.latitude,
+                    "longitude": location.longitude,
+                    "address": location.address,
+                }
+                external_map_location_source_total.labels(source="client_supplied").inc()
+            else:
+                # 메시지에서 지명 후보 추출 → geocoding 으로 좌표 변환
+                hint = _extract_location_hint(current_input)
+                if hint:
+                    geo = await geocoding.ainvoke({"query": hint})
+                    if geo and geo.get("latitude") and geo.get("longitude"):
+                        location_dict = {
+                            "latitude": geo["latitude"],
+                            "longitude": geo["longitude"],
+                            "address": geo.get("address") or hint,
+                        }
+                        location = Location(
+                            latitude=geo["latitude"],
+                            longitude=geo["longitude"],
+                            address=geo.get("address") or hint,
+                        )
+                        external_map_location_source_total.labels(source="geocoded").inc()
+
+            # 위치를 끝내 못 얻었으면 재질의 — execute_tool 호출조차 하지 않는다
+            if not location_dict:
+                msg = (
+                    "어느 지역 근처에서 찾으실까요? 🗺️ "
+                    "지하철역이나 동네 이름(예: '강남역', '홍대 입구', '잠실동')을 알려주세요."
+                )
+                elapsed_ms = (time.perf_counter() - node_start) * 1000
+                logger.info(
+                    "tool_executor_node_location_required",
+                    intent=intent_str,
+                    elapsed_ms=round(elapsed_ms, 1),
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                external_map_location_source_total.labels(source="missing").inc()
+                return {"response": msg}
+
+        # ── info 의도: state 에서 movie_id / movie_title 회수 ──
+        movie_id = _resolve_movie_id_from_state(state) if intent_str == "info" else None
+        movie_title = current_input if intent_str in ("info", "booking") else None
+
+        # ── 도구 디스패치 (병렬) ──
+        tool_results = await execute_tool(
+            intent=intent_str,
+            location=location_dict,
+            movie_id=movie_id,
+            movie_title=movie_title,
+            user_id=user_id,
+        )
+
+        # ── 응답 생성 (LLM 미사용, 템플릿 기반) ──
+        response = _format_tool_response(
+            intent=intent_str,
+            tool_results=tool_results,
+            location_address=(location_dict or {}).get("address"),
         )
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
-            "tool_executor_stub_node",
+            "tool_executor_node_done",
             intent=intent_str,
+            executed_tools=list(tool_results.keys()),
+            has_location=location is not None,
             elapsed_ms=round(elapsed_ms, 1),
             session_id=session_id,
             user_id=user_id,
         )
-        return {"response": response}
+
+        update: dict = {"tool_results": tool_results, "response": response}
+        if location is not None:
+            update["location"] = location
+        return update
 
     except Exception as e:
         elapsed_ms = (time.perf_counter() - node_start) * 1000
-        logger.error("tool_executor_node_error", error=str(e), error_type=type(e).__name__,
-                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1),
-                      session_id=session_id, user_id=user_id)
-        return {"response": "해당 기능은 아직 준비 중이에요. 영화 추천이 필요하시면 말씀해주세요!"}
+        logger.error(
+            "tool_executor_node_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+            user_id=user_id,
+        )
+        # 에러 전파 금지 — 친절한 fallback 메시지
+        return {
+            "tool_results": {},
+            "response": "관련 정보를 가져오지 못했어요. 잠시 후 다시 시도해주세요! 🎬",
+        }
 
 
 # ============================================================

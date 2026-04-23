@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
+from monglepick.agents.chat.models import Location
 from monglepick.config import settings
 from monglepick.db.clients import get_redis
 
@@ -424,6 +425,39 @@ chat_router = APIRouter(tags=["chat"])
 # 요청/응답 모델
 # ============================================================
 
+class LocationPayload(BaseModel):
+    """
+    사용자 위치 정보 (외부 지도 연동 — theater/booking 의도 처리용).
+
+    Client 가 navigator.geolocation 결과를 그대로 보낼 수 있도록 위경도만 받는다.
+    address 는 선택 — 사용자에게 보여줄 자연어 응답에 활용된다.
+    누락 시 Agent 측에서 사용자 메시지에서 지명을 추출해 geocoding 도구로 좌표 변환.
+    """
+
+    latitude: float = Field(..., description="위도 (예: 37.5665)")
+    longitude: float = Field(..., description="경도 (예: 126.9780)")
+    address: str | None = Field(
+        default=None,
+        description="원본 주소/지역명 (선택, 응답 자연어에 활용)",
+    )
+
+
+def _to_location(payload: LocationPayload | None) -> Location | None:
+    """
+    Wire 모델(LocationPayload) → 도메인 모델(Location) 변환.
+
+    필드 구조가 동일하므로 단순 매핑이지만, 도메인 모델을 외부에 노출하지 않기 위해
+    레이어 분리를 유지한다. None 입력은 None 으로 통과.
+    """
+    if payload is None:
+        return None
+    return Location(
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        address=payload.address,
+    )
+
+
 class ChatRequest(BaseModel):
     """
     채팅 요청 모델.
@@ -432,6 +466,7 @@ class ChatRequest(BaseModel):
     session_id: 세션 ID (빈 문자열이면 신규 세션)
     message: 사용자 입력 메시지 (1~2000자, 필수)
     image: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+    location: 사용자 위치 (theater/booking 의도에서만 사용, 미제공 시 메시지에서 지명 자동 추출)
     """
 
     model_config = {
@@ -442,12 +477,25 @@ class ChatRequest(BaseModel):
                     "session_id": "sess_abc",
                     "message": "우울한데 영화 추천해줘",
                     "image": None,
+                    "location": None,
                 },
                 {
                     "user_id": "",
                     "session_id": "",
                     "message": "봉준호 감독 영화 중에 볼만한 거 추천해줘",
                     "image": None,
+                    "location": None,
+                },
+                {
+                    "user_id": "user_123",
+                    "session_id": "sess_abc",
+                    "message": "근처 영화관 알려줘",
+                    "image": None,
+                    "location": {
+                        "latitude": 37.4979,
+                        "longitude": 127.0276,
+                        "address": "강남역",
+                    },
                 },
             ]
         }
@@ -470,6 +518,13 @@ class ChatRequest(BaseModel):
     image: str | None = Field(
         default=None,
         description="base64 인코딩된 이미지 데이터 (영화 포스터/분위기 사진 등)",
+    )
+    location: LocationPayload | None = Field(
+        default=None,
+        description=(
+            "사용자 위치 (선택). theater/booking 의도에서 카카오 Local 영화관 검색에 사용. "
+            "미제공 시 메시지에서 지명을 자동 추출해 geocoding 도구로 좌표 변환을 시도한다."
+        ),
     )
 
 
@@ -521,13 +576,19 @@ class ChatSyncResponse(BaseModel):
     response_description="SSE 이벤트 스트림 (text/event-stream). Swagger UI에서는 응답이 끝나지 않으므로 /chat/sync 동기 엔드포인트를 사용하세요.",
     responses={
         200: {
-            "description": "SSE 스트리밍 응답. 이벤트 타입: status, movie_card, token, done, error",
+            "description": (
+                "SSE 스트리밍 응답. 이벤트 타입: "
+                "session, status, movie_card, theater_card, now_showing, clarification, "
+                "token, point_update, done, error"
+            ),
             "content": {
                 "text/event-stream": {
                     "example": (
                         'event: status\ndata: {"phase": "intent", "message": "의도 분석 중..."}\n\n'
                         'event: token\ndata: {"delta": "우울할 때 보면 좋은 영화를 추천해드릴게요!"}\n\n'
                         'event: movie_card\ndata: {"title": "인사이드 아웃", "genres": ["애니메이션", "가족"]}\n\n'
+                        'event: theater_card\ndata: {"name": "CGV 강남", "chain": "CGV", "distance_m": 320, "place_url": "...", "booking_url": "..."}\n\n'
+                        'event: now_showing\ndata: {"movies": [{"rank": 1, "movie_nm": "...", "audi_acc": 1234567}]}\n\n'
                         "event: done\ndata: {}\n\n"
                     )
                 }
@@ -546,9 +607,14 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
     Content-Type: text/event-stream
 
     SSE 이벤트:
+    - session: 세션 ID 발행 (1회, 진입 직후)
     - status: 현재 처리 단계 (phase, message)
     - movie_card: 추천 영화 데이터 (RankedMovie JSON)
+    - theater_card: 외부 지도 — 영화관 단건 (theater_search 결과 N회)
+    - now_showing: 외부 지도 — KOBIS 박스오피스 Top-N 묶음 (1회)
+    - clarification: 후속 질문 + AI 제안 카드 (ClarificationResponse)
     - token: 응답 텍스트 (delta)
+    - point_update: AI 쿼터/포인트 잔량 갱신
     - done: 완료 신호
     - error: 에러 메시지
 
@@ -618,6 +684,16 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
         # effective_cost: 실제 차감 포인트 (무료 잔여가 있으면 0). graph.py deduct에 전달.
         from monglepick.config import settings as _settings
         _effective_cost: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값 (체크 실패 시 사용)
+        # ── 게스트(비로그인) 식별자 추출 — recommendation_ranker 완료 시 소비에 사용 ──
+        # 쿠키가 없거나 서명이 깨지면 guest_id=None 이 되어 downstream 은 anonymous fallback.
+        # Backend /api/v1/guest/token 을 Client 가 먼저 호출한 케이스라면 유효한 guest_id 를 얻는다.
+        from monglepick.api.guest_quota_client import (
+            extract_client_ip as _extract_client_ip,
+            parse_guest_cookie as _parse_guest_cookie,
+        )
+        _guest_id: str = _parse_guest_cookie(raw_request.cookies.get("mongle_guest")) or ""
+        _client_ip: str = _extract_client_ip(raw_request)
+
         if _settings.POINT_CHECK_ENABLED and request.user_id:
             from monglepick.api.point_client import check_point
             point_check = await check_point(
@@ -675,6 +751,33 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                 yield {"event": "done", "data": "{}"}
                 return
 
+        elif not request.user_id and _guest_id:
+            # ── 비로그인(게스트) — 쿠키+IP 기반 평생 1회 쿼터 체크 ──
+            # 쿠키(mongle_guest) 가 있으면 Backend 에 체크 요청. 차단 시 로그인 유도로 종료.
+            # 쿠키가 없으면(guest_id="") 차단하지 않는다 — Client 가 /api/v1/guest/token 을
+            # 아직 호출하지 않은 상태일 수 있어 UX 저해 우려. 소비 단계에서는 어차피 막힘.
+            from monglepick.api.guest_quota_client import check_quota as _check_guest_quota
+
+            guest_check = await _check_guest_quota(_guest_id, _client_ip)
+            if not guest_check.allowed:
+                logger.info(
+                    "chat_sse_guest_quota_exceeded",
+                    guest_id=_guest_id,
+                    client_ip=_client_ip,
+                    reason=guest_check.reason,
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": "무료 체험 1회를 모두 사용하셨어요. 더 많은 추천을 받으려면 로그인해주세요.",
+                        "error_code": "GUEST_QUOTA_EXCEEDED",
+                        "reason": guest_check.reason,
+                        "needs_login": True,
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
         # 슬롯이 없으면 대기 중 SSE 알림을 먼저 전송
         # 참고(C-3): locked()와 async with 사이에 경쟁 조건이 있을 수 있으나
@@ -703,6 +806,9 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                         message=request.message,
                         image_data=image_data,
                         effective_cost=_effective_cost,
+                        guest_id=_guest_id,
+                        client_ip=_client_ip,
+                        location=_to_location(request.location),
                     ):
                         yield sse_event
             else:
@@ -712,6 +818,9 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                     message=request.message,
                     image_data=image_data,
                     effective_cost=_effective_cost,
+                    guest_id=_guest_id,
+                    client_ip=_client_ip,
+                    location=_to_location(request.location),
                 ):
                     yield sse_event
 
@@ -810,6 +919,7 @@ async def chat_sync(request: ChatRequest, raw_request: Request):
                     message=request.message,
                     image_data=image_for_agent,
                     effective_cost=0,
+                    location=_to_location(request.location),
                 )
         else:
             state = await run_chat_agent_sync(
@@ -818,6 +928,7 @@ async def chat_sync(request: ChatRequest, raw_request: Request):
                 message=request.message,
                 image_data=image_for_agent,
                 effective_cost=0,
+                location=_to_location(request.location),
             )
 
     # State에서 응답 정보 추출
@@ -893,7 +1004,7 @@ async def chat_sync(request: ChatRequest, raw_request: Request):
 )
 async def chat_upload(
     raw_request: Request,
-    message: str = Form(..., min_length=1, max_length=2000, description="사용자 입력 메시지"),
+    message: str = Form(default="", max_length=2000, description="사용자 입력 메시지 — 이미지만 업로드할 때는 공란 허용 (image_analyzer 노드가 포스터 분석으로 인식)"),
     user_id: str = Form(default="", description="사용자 ID"),
     session_id: str = Form(default="", description="세션 ID"),
     image: UploadFile | None = File(default=None, description="이미지 파일 (JPEG/PNG, 최대 10MB)"),
@@ -984,6 +1095,14 @@ async def chat_upload(
         # ── 포인트 사전 체크 + 쿼터 검증 (업로드 엔드포인트) ──
         from monglepick.config import settings as _settings
         _effective_cost_upload: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값
+        # 게스트 식별 (쿠키+IP) — recommendation_ranker 완료 시 평생 1회 소비용
+        from monglepick.api.guest_quota_client import (
+            extract_client_ip as _extract_client_ip_upload,
+            parse_guest_cookie as _parse_guest_cookie_upload,
+        )
+        _guest_id_upload: str = _parse_guest_cookie_upload(raw_request.cookies.get("mongle_guest")) or ""
+        _client_ip_upload: str = _extract_client_ip_upload(raw_request)
+
         if _settings.POINT_CHECK_ENABLED and user_id:
             from monglepick.api.point_client import check_point
             point_check = await check_point(
@@ -1040,6 +1159,31 @@ async def chat_upload(
                 yield {"event": "done", "data": "{}"}
                 return
 
+        elif not user_id and _guest_id_upload:
+            # 비로그인(게스트) — 쿠키+IP 기반 평생 1회 쿼터 체크.
+            # 쿠키 없으면 스킵 (소비 단계에서도 어차피 막힘).
+            from monglepick.api.guest_quota_client import check_quota as _check_guest_quota_upload
+
+            guest_check = await _check_guest_quota_upload(_guest_id_upload, _client_ip_upload)
+            if not guest_check.allowed:
+                logger.info(
+                    "chat_upload_guest_quota_exceeded",
+                    guest_id=_guest_id_upload,
+                    client_ip=_client_ip_upload,
+                    reason=guest_check.reason,
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": "무료 체험 1회를 모두 사용하셨어요. 더 많은 추천을 받으려면 로그인해주세요.",
+                        "error_code": "GUEST_QUOTA_EXCEEDED",
+                        "reason": guest_check.reason,
+                        "needs_login": True,
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
         # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
         # 참고(C-3): locked()와 async with 사이에 경쟁 조건이 있을 수 있으나
         # UX 힌트 메시지 부정확만 발생하며 기능에는 영향 없음
@@ -1067,6 +1211,8 @@ async def chat_upload(
                         message=message,
                         image_data=image_data,
                         effective_cost=_effective_cost_upload,
+                        guest_id=_guest_id_upload,
+                        client_ip=_client_ip_upload,
                     ):
                         yield sse_event
             else:
@@ -1076,6 +1222,8 @@ async def chat_upload(
                     message=message,
                     image_data=image_data,
                     effective_cost=_effective_cost_upload,
+                    guest_id=_guest_id_upload,
+                    client_ip=_client_ip_upload,
                 ):
                     yield sse_event
 

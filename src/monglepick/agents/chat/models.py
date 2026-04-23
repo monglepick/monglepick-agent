@@ -34,6 +34,27 @@ from pydantic import BaseModel, Field
 from monglepick.config import settings as _settings
 
 # ============================================================
+# 외부 지도 연동 — 사용자 위치 (Phase 6 외부 지도 연동)
+# ============================================================
+
+class Location(BaseModel):
+    """
+    사용자 위치 정보 (theater 의도 처리 시 카카오 Local 검색에 사용).
+
+    Client 가 navigator.geolocation 으로 좌표를 직접 보낼 수도 있고,
+    사용자 메시지에 지명만 있으면 geocoding 도구가 좌표를 채워 넣는다.
+    address 는 둘 다 있을 때 응답 자연어에 활용된다.
+    """
+
+    latitude: float = Field(..., description="위도 (예: 37.5665)")
+    longitude: float = Field(..., description="경도 (예: 126.9780)")
+    address: str | None = Field(
+        default=None,
+        description="원본 주소/지역명 (선택, 사용자 응답 자연어 생성에 활용)",
+    )
+
+
+# ============================================================
 # 의도 분류 결과
 # ============================================================
 
@@ -645,6 +666,10 @@ class ChatAgentState(TypedDict, total=False):
     session_id: str
     current_input: str
     image_data: str | None  # base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+    # 사용자 위치 (외부 지도 연동) — Client 가 navigator.geolocation 으로 좌표를 보내거나
+    # 사용자가 지명만 입력했을 때 tool_executor_node 가 geocoding 으로 채워 넣는다.
+    # theater/booking 의도 외에는 미사용.
+    location: Location | None
 
     # ── context_loader 출력 ──
     user_profile: dict[str, Any]
@@ -679,6 +704,13 @@ class ChatAgentState(TypedDict, total=False):
 
     # ── response_formatter 출력 ──
     response: str
+
+    # ── tool_executor_node 출력 (Phase 6 외부 지도 연동) ──
+    # info/theater/booking 의도에서 INTENT_TOOL_MAP 의 도구들이 비동기 병렬 실행된 결과.
+    # 키: 도구 이름 (예: "theater_search", "kobis_now_showing", "movie_detail")
+    # 값: 도구 반환값 (list[dict] | dict | str)
+    # response_formatter 가 이 값을 SSE theater_card / movie_card / token 으로 분기 송출.
+    tool_results: dict[str, Any]
 
     # ── question_generator 출력 (Part 2: 구조화된 힌트 + 제안 옵션) ──
     # clarification.suggestions 에 Claude Code 스타일 제안 카드가 포함된다 (2026-04-15).

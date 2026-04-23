@@ -112,3 +112,51 @@ match_llm_reranker_duration_seconds: Histogram = Histogram(
     "Match v3 LLM 리랭커 호출 소요 시간 (초)",
     buckets=(0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0),
 )
+
+
+# ============================================================
+# Phase 6 외부 지도 연동 — 도구 호출 메트릭 (2026-04-23)
+# ============================================================
+#
+# tool_executor_node 가 INTENT_TOOL_MAP 으로 디스패치하는 외부 지도 도구들의
+# 호출 횟수 / 지연 / 실패율을 추적한다. Grafana 에서 다음 질문에 답할 수 있다:
+#   - "theater 의도 진입 시 location 미제공으로 geocoding 호출 비율은?"
+#   - "카카오 Local API 의 p95 지연시간은?"
+#   - "KOBIS 박스오피스 API 가 fault 응답을 돌려주는 빈도는?"
+#   - "도구별 timeout 발생률은?"
+#
+# 도구 이름은 라벨로 노출 — INTENT_TOOL_MAP 의 도구 수가 10개 내외라 카디널리티 안전.
+#
+# outcome 라벨 enum:
+#   "ok"          — 정상 결과 반환
+#   "empty"       — 정상 응답이지만 결과가 0건 (geocoding 미매칭, KOBIS 빈 응답)
+#   "no_api_key"  — API 키 미설정으로 호출 자체 스킵
+#   "fault"       — 외부 API 가 의미있는 에러 페이로드 반환 (KOBIS faultInfo, 카카오 4xx 등)
+#   "timeout"     — httpx.TimeoutException
+#   "exception"   — 기타 예외 (네트워크 에러 등)
+
+# 외부 지도 도구 호출 횟수
+external_map_tool_total: Counter = Counter(
+    "monglepick_external_map_tool_total",
+    "외부 지도 도구 호출 결과 (theater_search / kobis_now_showing / geocoding)",
+    labelnames=("tool", "outcome"),
+)
+
+# 외부 지도 도구 호출 지연시간 (초). 외부 API 왕복 + 파싱 포함 E2E.
+# 카카오/KOBIS 모두 보통 100~500ms 안에 응답하므로 작은 버킷 위주.
+external_map_tool_duration_seconds: Histogram = Histogram(
+    "monglepick_external_map_tool_duration_seconds",
+    "외부 지도 도구 호출 소요 시간 (초)",
+    labelnames=("tool",),
+    buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0),
+)
+
+# tool_executor_node 의 위치 해소 결과.
+#   source : "client_supplied" — Client 가 navigator.geolocation 좌표를 본문 location 에 보냄
+#            "geocoded"        — 메시지에서 지명 추출 → geocoding 도구로 좌표 획득 성공
+#            "missing"         — 둘 다 실패, 위치 재질의 응답 발행
+external_map_location_source_total: Counter = Counter(
+    "monglepick_external_map_location_source_total",
+    "tool_executor_node 의 location 해소 경로 분류",
+    labelnames=("source",),
+)
