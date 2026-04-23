@@ -73,9 +73,9 @@ class TestStep6bRoleMatrix:
         assert "user_suspend" not in names
 
     def test_stats_admin_sees_only_tier0(self):
-        """Step 6b 이후에도 STATS_ADMIN 은 여전히 Tier 0 만 (5개)."""
+        """v3 Phase A: STATS_ADMIN 은 Tier 0 만 — stats_extended/dashboard 확장으로 개수 증가."""
         names = {t.name for t in list_tools_for_role("STATS_ADMIN")}
-        assert len(names) == 5
+        assert len(names) >= 5
         assert all(ADMIN_TOOL_REGISTRY[n].tier == 0 for n in names)
 
 

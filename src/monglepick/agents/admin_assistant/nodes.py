@@ -19,9 +19,12 @@ Step 2 (2026-04-23, 추가):
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import traceback
 import uuid
+from typing import Any
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -33,6 +36,8 @@ from monglepick.agents.admin_assistant.models import (
     AdminIntent,
     ConfirmationPayload,
     ToolCall,
+    ensure_intent,
+    ensure_tool_call,
     normalize_admin_role,
 )
 from monglepick.api.admin_backend_client import AdminApiResult, summarize_for_llm
@@ -47,6 +52,8 @@ from monglepick.prompts.admin_assistant import (
     NARRATOR_HUMAN_PROMPT,
     NARRATOR_SYSTEM_PROMPT,
     SMALLTALK_SYSTEM_PROMPT,
+    SMART_FALLBACK_HUMAN_PROMPT,
+    SMART_FALLBACK_SYSTEM_PROMPT,
 )
 from monglepick.tools.admin_tools import (
     ADMIN_TOOL_REGISTRY,
@@ -55,6 +62,12 @@ from monglepick.tools.admin_tools import (
 )
 
 logger = structlog.get_logger()
+
+# ============================================================
+# ReAct 루프 상한 (Phase D v3)
+# ============================================================
+# 환경변수로 override 가능. 기본 5 (토큰 비용 + 무한 루프 방어).
+MAX_HOPS: int = int(os.getenv("ADMIN_ASSISTANT_MAX_HOPS", "5"))
 
 
 # ============================================================
@@ -69,6 +82,57 @@ _NOT_ADMIN_MESSAGE = (
 # ============================================================
 # intent 별 placeholder 응답 (Step 1: tool 실행 미구현)
 # ============================================================
+
+# ============================================================
+# Narrator 출력 후처리 — LLM 이 프롬프트 규칙을 어기고 메타/검증 체크리스트를
+# 응답에 섞어 내는 케이스 2차 방어 (2026-04-23 운영 발견 이슈).
+# ============================================================
+
+# 아래 패턴이 감지되면 그 지점 이후를 모두 잘라낸다. 실제 관리자에게 보여줄
+# "본문 + [출처: ...]" 는 이 패턴보다 앞에 오는 것이 정상이므로 공격적 truncate OK.
+_NARRATOR_META_CUT_PATTERNS: list[re.Pattern] = [
+    # "---" 단독 구분선 이후 전체 (LLM 이 --- 뒤에 검증 체크리스트를 붙이는 빈도 높음)
+    re.compile(r"\n\s*-{3,}\s*\n.*$", re.DOTALL),
+    # "**검증 사항**" / "검증 사항:" / "## 검증 사항" 같은 메타 헤더 이후 전체
+    re.compile(r"\n\s*\**#*\s*검증\s*사항\**.*$", re.DOTALL),
+    # "사고 과정" / "체크리스트" / "규칙 준수" 같은 유사 메타 헤더
+    re.compile(r"\n\s*\**#*\s*(사고\s*과정|체크리스트|규칙\s*준수)\**.*$", re.DOTALL),
+]
+
+# 위 truncation 과 별도로 "(※ 실제 응답 시 ~)" 같은 자기-인용 괄호 문단은 본문
+# 사이에도 끼어들 수 있어 문자열 전역에서 제거한다.
+_NARRATOR_INLINE_META_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\n*\(※[^)]{0,400}\)\n*", re.DOTALL),
+    re.compile(r"\n*\(\s*실제\s*응답\s*시[^)]{0,400}\)\n*", re.DOTALL),
+]
+
+
+def _sanitize_narrator_output(text: str) -> str:
+    """
+    narrator LLM 응답에서 메타/검증 체크리스트 누수를 제거한다.
+
+    전략:
+    - 길이 기반 truncation: "---" 또는 "**검증 사항**" 같은 시그니처 이후를 싹 자름.
+    - 인라인 제거: "(※ 실제 응답 시 ...)" 같은 괄호 자기-인용 문단을 전역 삭제.
+    - `[출처: ...]` 라인은 보존 (사용자에게 필요한 근거 표기).
+    - 최종 strip 으로 trailing 공백/개행 정리.
+
+    주의: 이 함수는 LLM 출력에 대한 **방어적 후처리** 일 뿐이며, 프롬프트(NARRATOR_SYSTEM_PROMPT)
+    에서 "메타 금지" 를 명시적으로 지시하는 것이 1차 방어다.
+    """
+    if not text:
+        return text
+    cleaned = text
+    # 1단계: 뒤쪽 메타 블록 잘라내기 (가장 먼저 매치되는 지점까지)
+    for pat in _NARRATOR_META_CUT_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    # 2단계: 본문 중간에 낀 자기-인용 괄호 제거
+    for pat in _NARRATOR_INLINE_META_PATTERNS:
+        cleaned = pat.sub("\n", cleaned)
+    # 마지막 공백 정리 + 빈 줄 3개 이상 연속 → 2줄로 축약
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
 
 # ============================================================
 # Audit target 추론 (Step 6b)
@@ -308,7 +372,8 @@ async def response_formatter(state: AdminAssistantState) -> dict:
     이 단계는 수치를 생성/가공하지 않는다 (§6.1 "LLM 은 숫자를 만들지 않는다").
     """
     admin_role = state.get("admin_role", "") or ""
-    intent = state.get("intent")
+    # MemorySaver 복원으로 dict 가 된 경우도 AdminIntent 로 되살림 (Step 6b 후속 방어)
+    intent = ensure_intent(state.get("intent"))
     already_composed = state.get("response_text", "") or ""
 
     # 1) 비관리자 차단
@@ -320,7 +385,7 @@ async def response_formatter(state: AdminAssistantState) -> dict:
         return {"response_text": already_composed}
 
     # 3) 나머지 intent 는 Step 1 placeholder
-    intent_kind = intent.kind if isinstance(intent, AdminIntent) else "smalltalk"
+    intent_kind = intent.kind if intent is not None else "smalltalk"
     placeholder = _PLACEHOLDER_MESSAGES.get(
         intent_kind,
         "요청을 처리하지 못했어요. 다시 한 번 말씀해주시겠어요?",
@@ -334,30 +399,101 @@ async def response_formatter(state: AdminAssistantState) -> dict:
 
 async def tool_selector(state: AdminAssistantState) -> dict:
     """
-    stats/query intent 에서 Solar bind_tools 로 단일 tool-call 을 선택한다.
+    stats/query/action intent 에서 Solar bind_tools 로 단일 tool-call 을 선택한다 (v3 Phase D).
 
+    v3 변경점:
+    - state 에서 iteration_count / tool_call_history / tool_results_history 를 읽어
+      tool_history_summary 문자열을 생성한 뒤 select_admin_tool 에 전달.
+    - finish_task 가 선택된 경우: pending_tool_call 에 finish_task ToolCall 을 담아 반환.
+      route_after_tool_select 가 이를 감지해 tool_executor 를 건너뛰고 narrator 로 직행.
     - admin_role 이 없거나 레지스트리 필터 결과가 비어있으면 pending_tool_call=None.
-    - LLM 응답에 tool_call 이 없으면 pending_tool_call=None → response_formatter 로 직행.
+    - LLM 응답에 tool_call 이 없으면 pending_tool_call=None → smart_fallback_responder 로 직행.
     - 성공 시 ToolCall 객체를 state.pending_tool_call 에 저장. tier 는 레지스트리에서 주입.
     """
     admin_role = state.get("admin_role", "") or ""
     admin_id = state.get("admin_id", "") or ""
     user_message = state.get("user_message", "") or ""
-    intent = state.get("intent")
-    intent_kind = intent.kind if isinstance(intent, AdminIntent) else "unknown"
+    intent = ensure_intent(state.get("intent"))
+    intent_kind = intent.kind if intent is not None else "unknown"
+
+    # 현재 hop 카운트 (iteration_count 재사용)
+    hop_count: int = state.get("iteration_count") or 0
+
+    # 이전 hop 결과 이력에서 tool_history_summary 생성
+    # 형식: "1. tool_name → ok=True row_count=5\n2. ..."
+    results_history: list[dict[str, Any]] = list(state.get("tool_results_history") or [])
+    summary_lines: list[str] = []
+    for idx, entry in enumerate(results_history, start=1):
+        tool_name = entry.get("tool_name", "?")
+        ok = entry.get("ok", False)
+        row_count = entry.get("row_count")
+        row_str = f" row_count={row_count}" if row_count is not None else ""
+        summary_lines.append(f"{idx}. {tool_name} → ok={ok}{row_str}")
+    tool_history_summary: str = "\n".join(summary_lines) if summary_lines else ""
 
     if not admin_role or not user_message.strip():
         return {"pending_tool_call": None}
+
+    # ── Step 7a: Tool 카테고리 필터 — Qdrant 없이 이름 컨벤션 + 키워드로 후보 축소 ──
+    # intent_kind + 이름 컨벤션(stats_*, dashboard_*, *_draft, goto_*) + 도메인 키워드로
+    # 76 tool 을 LLM bind 전에 최대 30 개로 좁힌다. 별도 인프라·임베딩 비용 없음.
+    # ADMIN_TOOL_FILTER_MAX (기본 30) 으로 상한 조정 가능. 카테고리 결과 비면 role 전체 fallback.
+    filter_max: int = int(os.getenv("ADMIN_TOOL_FILTER_MAX", "30"))
+
+    allowed_tool_names: list[str] | None = None
+    if admin_role:
+        try:
+            from monglepick.tools.admin_tools.tool_filter import shortlist_tools_by_category
+            allowed_tool_names = shortlist_tools_by_category(
+                user_message=user_message,
+                admin_role=admin_role,
+                intent_kind=intent_kind,
+                max_tools=filter_max,
+            )
+            logger.info(
+                "admin_tool_filter_candidates",
+                count=len(allowed_tool_names),
+                top=allowed_tool_names[:5],
+                hop_count=hop_count,
+            )
+        except Exception as filter_err:
+            # 필터 자체가 실패하면 None → select_admin_tool 이 role 기반 전체 bind
+            logger.warning(
+                "admin_tool_filter_failed_fallback_all",
+                error=str(filter_err),
+                error_type=type(filter_err).__name__,
+            )
+            allowed_tool_names = None
 
     selected = await select_admin_tool(
         user_message=user_message,
         admin_role=admin_role,
         intent_kind=intent_kind,
         request_id=f"admin:{admin_id[:8]}" if admin_id else "admin:anon",
+        tool_history_summary=tool_history_summary,
+        hop_count=hop_count,
+        max_hops=MAX_HOPS,
+        allowed_tool_names=allowed_tool_names,
     )
 
     if selected is None:
         return {"pending_tool_call": None}
+
+    # finish_task 가상 tool: 레지스트리에 없지만 tier=0 으로 처리.
+    # route_after_tool_select 에서 이 이름을 감지해 narrator 로 직행.
+    if selected.name == "finish_task":
+        call = ToolCall(
+            tool_name="finish_task",
+            arguments=selected.arguments,
+            tier=0,
+            rationale=selected.rationale,
+        )
+        logger.info(
+            "admin_tool_selector_finish_task",
+            hop_count=hop_count,
+            reason=selected.arguments.get("reason", ""),
+        )
+        return {"pending_tool_call": call}
 
     # 레지스트리에서 tier 주입 (selector 체인은 tier 를 반환하지 않음)
     spec = ADMIN_TOOL_REGISTRY.get(selected.name)
@@ -386,7 +522,8 @@ async def tool_executor(state: AdminAssistantState) -> dict:
     - 결과는 tool_results_cache[ref_id] 에 저장하고, ref_id 를 state.latest_tool_ref_id 에 기록.
     - 실패(ok=False) 결과도 그대로 캐시한다 — narrator 가 error 메시지를 정확히 서술하도록.
     """
-    call: ToolCall | None = state.get("pending_tool_call")
+    # MemorySaver 직렬화로 dict 복원된 경우도 ToolCall 로 되살림 (Step 6b 후속 방어)
+    call = ensure_tool_call(state.get("pending_tool_call"))
     admin_role = state.get("admin_role", "") or ""
     cache = dict(state.get("tool_results_cache", {}) or {})
 
@@ -530,7 +667,7 @@ async def narrator(state: AdminAssistantState) -> dict:
     """
     ref_id = state.get("latest_tool_ref_id", "") or ""
     cache = state.get("tool_results_cache", {}) or {}
-    call: ToolCall | None = state.get("pending_tool_call")
+    call = ensure_tool_call(state.get("pending_tool_call"))
 
     if not ref_id or ref_id not in cache:
         # tool_selector 가 None 을 낸 경우 — response_formatter 에서 placeholder 처리
@@ -564,15 +701,19 @@ async def narrator(state: AdminAssistantState) -> dict:
             model="solar_api",
             request_id=f"admin_narrator:{ref_id}",
         )
-        text = getattr(response, "content", None) or str(response)
+        raw_text = getattr(response, "content", None) or str(response)
+        # 2차 방어: LLM 이 프롬프트 규칙을 어기고 "검증 사항" / "---" / "(※ ~)" 같은
+        # 메타 텍스트를 섞어 내는 케이스를 후처리로 제거 (2026-04-23 운영 발견 이슈).
+        text = _sanitize_narrator_output(raw_text)
         elapsed_ms = (time.perf_counter() - start) * 1000
         logger.info(
             "admin_narrator_generated",
             tool_name=tool_name,
-            length=len(text),
+            raw_length=len(raw_text),
+            sanitized_length=len(text),
             elapsed_ms=round(elapsed_ms, 1),
         )
-        return {"response_text": text.strip()}
+        return {"response_text": text}
 
     except Exception as e:
         elapsed_ms = (time.perf_counter() - start) * 1000
@@ -599,10 +740,176 @@ async def narrator(state: AdminAssistantState) -> dict:
 
 
 # ============================================================
-# Step 5a Node — risk_gate (HITL 승인 게이트)
+# Phase D v3 Node — observation
 # ============================================================
 
-async def risk_gate(state: AdminAssistantState) -> dict:
+async def observation(state: AdminAssistantState) -> dict:
+    """
+    tool_executor 결과를 tool_call_history / tool_results_history 에 누적한다 (v3 Phase D).
+
+    역할:
+    - pending_tool_call 을 tool_call_history 에 append.
+    - tool_results_cache[latest_tool_ref_id] 에서 결과를 꺼내 축약본을 tool_results_history 에 append.
+    - iteration_count(= hop_count) 를 1 증가.
+    - route_after_observation 이 이 노드 이후 경로를 결정한다:
+        * 마지막 tool 이 finish_task → narrator 직행
+        * 마지막 tool 이 *_draft → draft_emitter
+        * 마지막 tool 이 goto_* → navigator
+        * 그 외 read tool → tool_selector (다음 hop)
+        * hop_count >= MAX_HOPS → narrator 강제 종결
+
+    에러 전파 금지 — tool_results 파싱 실패 시 ok=False 축약본을 기록하고 계속 진행.
+    """
+    call = ensure_tool_call(state.get("pending_tool_call"))
+    cache: dict[str, Any] = state.get("tool_results_cache", {}) or {}
+    ref_id: str = state.get("latest_tool_ref_id", "") or ""
+    result = cache.get(ref_id) if ref_id else None
+
+    # tool_call_history 누적 (ToolCall 을 그대로 append — MemorySaver 직렬화로 dict 화됨)
+    history: list = list(state.get("tool_call_history") or [])
+    results_history: list[dict[str, Any]] = list(state.get("tool_results_history") or [])
+
+    if call is not None:
+        history.append(call)
+
+    # 결과 축약본 생성
+    if result is not None:
+        # AdminApiResult 인스턴스와 dict 양쪽 처리 (테스트 환경은 dict 를 쓰기도 함)
+        if isinstance(result, AdminApiResult):
+            ok = result.ok
+            row_count = result.row_count
+        elif isinstance(result, dict):
+            ok = bool(result.get("ok", False))
+            row_count = result.get("row_count")
+        else:
+            ok = False
+            row_count = None
+
+        results_history.append({
+            "tool_name": call.tool_name if call else "",
+            "ok": ok,
+            "row_count": row_count,
+            "summary": "",  # 필요 시 narrator 가 full result 에서 생성
+        })
+        logger.info(
+            "admin_observation_recorded",
+            tool_name=call.tool_name if call else "(none)",
+            ok=ok,
+            row_count=row_count,
+            hop_after=(state.get("iteration_count") or 0) + 1,
+        )
+    else:
+        logger.debug(
+            "admin_observation_no_result",
+            ref_id=ref_id or "(empty)",
+            tool_name=call.tool_name if call else "(none)",
+        )
+
+    return {
+        "tool_call_history": history,
+        "tool_results_history": results_history,
+        "iteration_count": (state.get("iteration_count") or 0) + 1,
+    }
+
+
+# ============================================================
+# Phase D v3 Node — draft_emitter
+# ============================================================
+
+async def draft_emitter(state: AdminAssistantState) -> dict:
+    """
+    *_draft tool 실행 직후 결과를 state.form_prefill 로 확정한다 (v3 Phase D).
+
+    - tool_results_cache[latest_tool_ref_id].data 가 dict 이면 form_prefill 로 저장.
+    - graph.py 의 SSE 루프가 이 노드 완료 시 form_prefill 이벤트를 발행한다.
+    - Backend 는 호출하지 않는다 — Draft tool 자체가 Backend 미호출이다.
+    - 에러 전파 금지: data 가 없거나 dict 가 아니면 form_prefill=None 으로 처리.
+    """
+    cache: dict[str, Any] = state.get("tool_results_cache", {}) or {}
+    ref_id: str = state.get("latest_tool_ref_id", "") or ""
+    result = cache.get(ref_id) if ref_id else None
+
+    data: Any = None
+    if isinstance(result, AdminApiResult):
+        data = result.data
+    elif isinstance(result, dict):
+        data = result.get("data")
+
+    if not isinstance(data, dict):
+        logger.debug(
+            "admin_draft_emitter_no_data",
+            ref_id=ref_id or "(empty)",
+            data_type=type(data).__name__,
+        )
+        return {"form_prefill": None}
+
+    logger.info(
+        "admin_draft_emitter_set",
+        target_path=data.get("target_path", ""),
+        tool_name=data.get("tool_name", ""),
+    )
+    return {"form_prefill": data}
+
+
+# ============================================================
+# Phase D v3 Node — navigator
+# ============================================================
+
+async def navigator(state: AdminAssistantState) -> dict:
+    """
+    goto_* tool 실행 직후 결과를 state.navigation 으로 확정한다 (v3 Phase D).
+
+    - tool_results_cache[latest_tool_ref_id].data 가 dict 이면 navigation 으로 저장.
+    - graph.py 의 SSE 루프가 이 노드 완료 시 navigation 이벤트를 발행한다.
+    - Backend 는 호출하지 않는다 — Navigate tool 이 내부적으로 read 를 한 번 호출해 이미 결과를 담아 온다.
+    - candidates 가 여러 개인 경우에도 navigation.candidates 배열로 그대로 전달한다.
+    - 에러 전파 금지: data 가 없거나 dict 가 아니면 navigation=None 으로 처리.
+    """
+    cache: dict[str, Any] = state.get("tool_results_cache", {}) or {}
+    ref_id: str = state.get("latest_tool_ref_id", "") or ""
+    result = cache.get(ref_id) if ref_id else None
+
+    data: Any = None
+    if isinstance(result, AdminApiResult):
+        data = result.data
+    elif isinstance(result, dict):
+        data = result.get("data")
+
+    if not isinstance(data, dict):
+        logger.debug(
+            "admin_navigator_no_data",
+            ref_id=ref_id or "(empty)",
+            data_type=type(data).__name__,
+        )
+        return {"navigation": None}
+
+    logger.info(
+        "admin_navigator_set",
+        target_path=data.get("target_path"),
+        label=data.get("label", ""),
+        candidates_count=len(data.get("candidates", [])),
+    )
+    return {"navigation": data}
+
+
+# ============================================================
+# Step 5a Node — risk_gate (HITL 승인 게이트) — v3 에서 비활성화
+# ============================================================
+# Phase D v3 재설계에서 risk_gate 는 그래프에서 제거되었다.
+# 실제 쓰기 tool 이 없어져 HITL interrupt 가 불필요하기 때문이다.
+# 함수는 _deprecated_risk_gate 로 이름 변경해 dead code 로 보존 (revert 대비).
+
+async def _deprecated_risk_gate(state: AdminAssistantState) -> dict:  # noqa: D401
+    """DEPRECATED — v3 Phase D 에서 그래프에서 제거됨. 아래 구현은 revert 용 보존."""
+    return await _impl_deprecated_risk_gate(state)
+
+
+# v2 하위호환 — `from ... import risk_gate` 로 참조하는 레거시 테스트·모듈이 남아있음.
+# Phase E 에서 테스트 정리 후 제거 예정. 지금은 동일 deprecated 함수를 alias 로 노출.
+risk_gate = _deprecated_risk_gate
+
+
+async def _impl_deprecated_risk_gate(state: AdminAssistantState) -> dict:
     """
     Tier≥2 쓰기 작업이 실행되기 전 사용자 승인을 받는 관문.
 
@@ -620,7 +927,8 @@ async def risk_gate(state: AdminAssistantState) -> dict:
     주의: Tier 4(SQL) 는 레지스트리에 등록이 금지되어 있지만, 혹시 등록돼도 tool_executor 가
     재차 차단한다.
     """
-    call: ToolCall | None = state.get("pending_tool_call")
+    # MemorySaver 직렬화로 dict 복원된 경우도 ToolCall 로 되살림 (Step 6b 후속 방어)
+    call = ensure_tool_call(state.get("pending_tool_call"))
     if call is None:
         return {}
 
@@ -697,3 +1005,78 @@ async def risk_gate(state: AdminAssistantState) -> dict:
         "pending_tool_call": None,
         "response_text": reject_msg,
     }
+
+
+# ============================================================
+# Smart Fallback Node (2026-04-23) — tool 매칭 실패 시 LLM 역제안
+# ============================================================
+
+async def smart_fallback_responder(state: AdminAssistantState) -> dict:
+    """
+    tool_selector 가 pending_tool_call=None 을 낸 경우(= 현재 tool 목록으로 답할 수
+    없는 질문) 고정 placeholder 대신 Solar 가 **사용 가능한 tool 목록을 컨텍스트로**
+    "이런 표현으로 바꾸면 답할 수 있어요" 역제안을 생성한다.
+
+    사용자 체감상 기존의 "적합한 도구를 찾지 못했어요" 고정 메시지 → "아 이렇게 물어보면
+    되는구나" 가 되도록 자연어 가이드를 돌려준다. 에이전트가 "LLM 이 없는 것처럼 뻣뻣하다"
+    는 피드백의 해소책.
+
+    실패 시 graceful — Solar 예외가 나도 response_text 에 짧은 안내를 넣는다.
+    """
+    admin_role = state.get("admin_role", "") or ""
+    user_message = state.get("user_message", "") or ""
+
+    if not admin_role or not user_message.strip():
+        # 관리자 아님 혹은 빈 발화 — response_formatter 가 기본 placeholder 로 처리하도록 pass
+        return {}
+
+    # 허용된 tool 카탈로그 (이름 + 설명 요약 100자) 를 프롬프트에 주입
+    allowed = list_tools_for_role(admin_role)
+    if not allowed:
+        # 권한이 전혀 없는 상태 — response_formatter 의 query placeholder 에 위임
+        return {}
+
+    catalog_lines = []
+    for spec in allowed:
+        # 설명은 150자로 컷 + tool 이름 (LLM 이 한국어로 의역하도록 지시하되 내부적으론 참고용)
+        desc = (spec.description or "").strip().replace("\n", " ")
+        if len(desc) > 150:
+            desc = desc[:150] + "..."
+        catalog_lines.append(f"- {spec.name} — {desc}")
+    tool_catalog = "\n".join(catalog_lines)
+
+    start = time.perf_counter()
+    try:
+        llm = get_solar_api_llm(temperature=0.4)
+        system = SystemMessage(content=SMART_FALLBACK_SYSTEM_PROMPT)
+        human = HumanMessage(content=SMART_FALLBACK_HUMAN_PROMPT.format(
+            admin_role=admin_role,
+            user_message=user_message,
+            tool_catalog=tool_catalog,
+        ))
+        response = await guarded_ainvoke(
+            llm, [system, human],
+            model="solar_api",
+            request_id="admin_smart_fallback",
+        )
+        raw_text = getattr(response, "content", None) or str(response)
+        # narrator 와 동일한 sanitize 재사용 — 메타/구분선/자기-인용 제거
+        text = _sanitize_narrator_output(raw_text)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "admin_smart_fallback_generated",
+            length=len(text),
+            catalog_size=len(allowed),
+            elapsed_ms=round(elapsed_ms, 1),
+        )
+        return {"response_text": text or _PLACEHOLDER_MESSAGES.get("query", "")}
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.warning(
+            "admin_smart_fallback_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+            elapsed_ms=round(elapsed_ms, 1),
+        )
+        # 실패 시 기존 query placeholder 로 폴백
+        return {"response_text": _PLACEHOLDER_MESSAGES.get("query", "")}

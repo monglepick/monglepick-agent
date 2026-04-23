@@ -316,10 +316,19 @@ async def admin_assistant_resume(
     """
     HITL 승인/거절 후 LangGraph interrupt 지점을 재개한다.
 
-    - 관리자 JWT 재검증 (risk_gate 에서 원래 통과했어도 세션 탈취 시 보호)
+    v3 주의: risk_gate 노드가 제거되어 이 엔드포인트는 v3 에서 실제로 interrupt 를
+    발동하지 않는다. 호출해도 snapshot.next 가 비어있어 그래프가 즉시 done 을 발행한다.
+    엔드포인트 자체는 하위 호환 및 향후 HITL 재도입 대비로 보존 (403 으로 차단하지 않음).
+
+    - 관리자 JWT 재검증 (세션 탈취 방어)
     - ConfirmationDecision Pydantic 으로 decision 값 검증(approve/reject)
-    - run_admin_assistant 에 resume_payload 를 실어 다시 SSE 스트리밍 실행
+    - run_admin_assistant 에 resume_payload 를 실어 SSE 스트리밍 실행 (v3 에서 즉시 done)
     """
+    logger.warning(
+        "admin_assistant_resume_v3_noop",
+        message="v3: HITL 재개 비활성화 — risk_gate 제거로 interrupt 발동 안 함. no-op 으로 흘러감.",
+        session_id=request.session_id,
+    )
     auth = _extract_admin_context(raw_request)
 
     try:

@@ -185,67 +185,70 @@ class TestAdminAssistantGraph:
         assert response.startswith("안녕하세요")
 
     @pytest.mark.asyncio
-    async def test_action_intent_returns_placeholder(self, mock_ollama):
-        """action 은 Tier 2/3 HITL 인프라 부재로 여전히 placeholder."""
+    async def test_action_intent_goes_through_tool_selector_path(self, mock_ollama):
+        """
+        action intent — route_after_intent 에 의해 tool_selector 로 분기된다 (Step 5a+).
+        mock 환경에선 bind_tools 가 MagicMock 이라 selector 가 None → smart_fallback_responder
+        가 Solar fallback 응답을 생성. mock_ollama 자유 텍스트가 그대로 response_text 에 담김.
+        """
         mock_ollama.set_structured_response(
             AdminIntent(kind="action", confidence=0.95, reason="배너 등록"),
         )
+        mock_ollama.set_response("이렇게 바꿔 말씀해 주실래요?")
         state = await run_admin_assistant_sync(
             admin_id="admin-001",
             admin_role="SUPER_ADMIN",
             admin_jwt="",
-            session_id="",  # 매번 uuid4 자동 생성 — MemorySaver thread 충돌 방지
+            session_id="",
             user_message="겨울 프로모 배너 등록해줘",
         )
         response = state.get("response_text", "")
-        # Tier 2/3 쓰기 작업은 HITL 미도입 안내 ("아직 구현되지 않았어요" + "HITL")
-        assert "구현되지" in response or "HITL" in response
-        # Step 5a 부터 session_id 는 uuid4 자동 생성. 존재/형태만 검증.
+        # tool 실행 없이 smart_fallback 가 돌린 LLM 응답이 나와야 한다
+        assert len(response) > 0
+        assert state.get("pending_tool_call") is None
         assert len(state.get("session_id") or "") >= 10
 
     @pytest.mark.asyncio
-    async def test_query_intent_falls_back_when_no_tool_match(self, mock_ollama):
+    async def test_query_intent_falls_back_to_smart_fallback(self, mock_ollama):
         """
-        Step 4: query 는 tool_selector 로 분기된다. mock 환경에서 bind_tools() 가 MagicMock
-        을 반환해 selector 가 graceful 하게 None → response_formatter 가 query placeholder
-        ("적합한 도구를 찾지 못했어요") 로 응답한다.
+        Step 6c(2026-04-23): query tool 매칭 실패 → smart_fallback_responder 가 Solar
+        fallback 응답 생성 (기존의 고정 placeholder 대신 LLM 역제안).
         """
         mock_ollama.set_structured_response(
             AdminIntent(kind="query", confidence=0.95, reason="유저 조회"),
         )
+        mock_ollama.set_response("이 질문은 사용자 목록 조회로 바꿔 말씀해 주실래요?")
         state = await run_admin_assistant_sync(
             admin_id="admin-001",
             admin_role="SUPER_ADMIN",
             admin_jwt="",
-            session_id="",  # 매번 uuid4 자동 생성 — MemorySaver thread 충돌 방지
+            session_id="",
             user_message="user_id=abc 결제 내역 보여줘",
         )
         response = state.get("response_text", "")
-        assert "적합한 도구" in response
-        # Step 5a 부터 session_id 는 uuid4 자동 생성. 존재/형태만 검증.
+        assert len(response) > 0
+        assert state.get("pending_tool_call") is None
         assert len(state.get("session_id") or "") >= 10
 
     @pytest.mark.asyncio
-    async def test_stats_intent_without_tool_match_falls_back(self, mock_ollama):
+    async def test_stats_intent_falls_back_to_smart_fallback(self, mock_ollama):
         """
-        Step 2: stats intent 는 tool_selector 로 분기된다. mock 환경에서는
-        `bind_tools()` 가 MagicMock 을 반환해 selector 가 graceful 하게 None 을 내므로
-        response_formatter 가 stats placeholder("적합한 도구를 찾지 못했어요") 로 응답한다.
+        Step 6c(2026-04-23): stats tool 매칭 실패 → smart_fallback_responder 경로.
         """
         mock_ollama.set_structured_response(
             AdminIntent(kind="stats", confidence=0.95, reason="DAU"),
         )
+        mock_ollama.set_response("DAU 관련은 '지난 7일 DAU 추이' 로 물어봐 주세요.")
         state = await run_admin_assistant_sync(
             admin_id="admin-001",
             admin_role="STATS_ADMIN",
             admin_jwt="",
-            session_id="",  # 매번 uuid4 자동 생성 — MemorySaver thread 충돌 방지
+            session_id="",
             user_message="지난 7일 DAU 알려줘",
         )
         response = state.get("response_text", "")
-        # Step 2 stats placeholder — tool 매칭 실패 fallback 문구
-        assert "적합한 도구" in response
-        # Step 5a 부터 session_id 는 uuid4 자동 생성. 존재/형태만 검증.
+        assert len(response) > 0
+        assert state.get("pending_tool_call") is None
         assert len(state.get("session_id") or "") >= 10
 
     @pytest.mark.asyncio

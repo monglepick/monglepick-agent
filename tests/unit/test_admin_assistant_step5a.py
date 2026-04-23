@@ -33,6 +33,13 @@ from monglepick.chains.admin_tool_selector_chain import SelectedTool
 from monglepick.tools.admin_tools import ADMIN_TOOL_REGISTRY, ToolContext
 
 
+
+# v3 Phase E: Tier 2 write tools 제거, HITL 비활성화
+# 이 파일의 모든 테스트는 v2 HITL 메커니즘에 의존하므로 스킵처리
+pytestmark = pytest.mark.skip(
+    reason="v3 Phase D: Tier 2 write tools (faq_create, banner_create) 제거, risk_gate/interrupt 비활성화"
+)
+
 # ============================================================
 # 1) Tier 2 tool 레지스트리 등록 확인
 # ============================================================

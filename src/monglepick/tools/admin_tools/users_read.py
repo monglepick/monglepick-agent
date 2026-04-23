@@ -252,3 +252,96 @@ register_tool(ToolSpec(
     args_schema=_UserPagedArgs,
     handler=_handle_user_payments,
 ))
+
+
+# ─ v3 확장 ─────────────────────────────────────────────────────────────────
+
+
+# 추가 Role matrix — 기존 _USERS_READ_ROLES 에서 MODERATOR/SUPPORT_ADMIN 으로 범위 조정
+# 설계서 §4.2: user_rewards / user_suspension_history → SUPER_ADMIN, ADMIN, MODERATOR, SUPPORT_ADMIN
+_USERS_MOD_ROLES: set[str] = {
+    "SUPER_ADMIN", "ADMIN", "MODERATOR", "SUPPORT_ADMIN",
+}
+
+
+# ── Args Schemas (v3 추가) ──────────────────────────────────────────────────
+
+class _UserIdOnlyArg(BaseModel):
+    """userId 하나만 받는 단순 조회용 스키마 (rewards / suspension-history 공용)."""
+
+    userId: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "조회 대상 사용자 ID (VARCHAR(50) PK). "
+            "발화에 userId 가 반드시 명시되어야 한다."
+        ),
+    )
+
+
+# ── Handlers (v3 추가) ────────────────────────────────────────────────────
+
+async def _handle_user_rewards(
+    ctx: ToolContext,
+    userId: str,
+) -> AdminApiResult:
+    """GET /api/v1/admin/users/{userId}/rewards — 사용자 리워드 목록 조회."""
+    raw = await get_admin_json(
+        f"/api/v1/admin/users/{userId}/rewards",
+        admin_jwt=ctx.admin_jwt,
+        invocation_id=ctx.invocation_id,
+    )
+    return unwrap_api_response(raw)
+
+
+async def _handle_user_suspension_history(
+    ctx: ToolContext,
+    userId: str,
+) -> AdminApiResult:
+    """GET /api/v1/admin/users/{userId}/suspension-history — 정지 이력 조회."""
+    raw = await get_admin_json(
+        f"/api/v1/admin/users/{userId}/suspension-history",
+        admin_jwt=ctx.admin_jwt,
+        invocation_id=ctx.invocation_id,
+    )
+    return unwrap_api_response(raw)
+
+
+# ── Registration (v3 추가) ─────────────────────────────────────────────────
+
+register_tool(ToolSpec(
+    name="user_rewards",
+    tier=1,
+    required_roles=_USERS_MOD_ROLES,
+    description=(
+        "특정 사용자가 획득한 리워드 목록을 조회한다. userId 필수. "
+        "어떤 리워드를 언제 얼마나 받았는지, 업적·도장깨기·출석 등 지급 이력을 "
+        "확인할 때 사용한다. '이 유저 리워드 내역', '적립 이력 보여줘' 에 활용."
+    ),
+    example_questions=[
+        "user_id=abc 리워드 지급 이력 보여줘",
+        "이 유저 업적 보상 얼마나 받았어?",
+        "출석 리워드 언제 마지막으로 받았는지 확인해줘",
+    ],
+    args_schema=_UserIdOnlyArg,
+    handler=_handle_user_rewards,
+))
+
+
+register_tool(ToolSpec(
+    name="user_suspension_history",
+    tier=1,
+    required_roles=_USERS_MOD_ROLES,
+    description=(
+        "특정 사용자의 계정 정지 이력을 조회한다. userId 필수. "
+        "정지 사유·기간·처리 관리자 등 히스토리를 파악할 때 사용한다. "
+        "'이 유저 정지된 적 있어?', '정지 사유 뭐야?', '몇 번 정지됐어?' 에 사용."
+    ),
+    example_questions=[
+        "user_id=abc 정지 이력 확인",
+        "이 유저 계정 정지된 이유 뭐야?",
+        "정지 해제 이력도 보여줘",
+    ],
+    args_schema=_UserIdOnlyArg,
+    handler=_handle_user_suspension_history,
+))

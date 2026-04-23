@@ -144,7 +144,9 @@ class TestToolRegistry:
 class TestToolSelectorNode:
     @pytest.mark.asyncio
     async def test_selects_and_injects_tier(self, monkeypatch):
-        async def fake_select(user_message, admin_role, intent_kind, request_id=""):
+        async def fake_select(user_message, admin_role, intent_kind, request_id="",
+                            tool_history_summary=None, hop_count=0, max_hops=5,
+                            allowed_tool_names=None):
             return SelectedTool(
                 name="stats_overview",
                 arguments={"period": "7d"},
@@ -326,7 +328,8 @@ class TestGraphStatsE2E:
         )
 
         # 3) select_admin_tool 을 fake 로 교체 (Solar bind_tools 우회)
-        async def fake_select(user_message, admin_role, intent_kind, request_id=""):
+        # v3 Phase D: tool_selector 가 tool_history_summary/hop_count/max_hops 를 추가 전달하므로 **kwargs 수용
+        async def fake_select(user_message, admin_role, intent_kind, request_id="", **_ignored):
             return SelectedTool(
                 name="stats_overview",
                 arguments={"period": "7d"},
@@ -365,14 +368,18 @@ class TestGraphStatsE2E:
         assert "1,234" in response
 
     @pytest.mark.asyncio
-    async def test_stats_no_tool_falls_back_to_placeholder(
+    async def test_stats_no_tool_goes_to_smart_fallback(
         self, monkeypatch, mock_ollama,
     ):
         """
-        stats intent 이지만 select_admin_tool 이 None → placeholder 안내.
+        Step 6c(2026-04-23): stats intent 이지만 selector None → smart_fallback_responder
+        가 LLM 역제안을 생성한다 (기존 placeholder 직결 대신).
         """
         mock_ollama.set_structured_response(
             AdminIntent(kind="stats", confidence=0.9),
+        )
+        mock_ollama.set_response(
+            "해당 수치 통계 도구는 없어요. 'DAU 추이' 나 '매출 추이' 로 물어봐 주실래요?"
         )
 
         async def fake_select(**kwargs):
@@ -390,5 +397,5 @@ class TestGraphStatsE2E:
             user_message="우리 회사 주식 가격 얼마야?",  # tool 범위 밖
         )
         assert state.get("pending_tool_call") is None
-        # response_formatter 가 _PLACEHOLDER_MESSAGES["stats"] 사용
-        assert "적합한 도구" in state.get("response_text", "")
+        # smart_fallback_responder 가 LLM 응답을 response_text 에 담아줌 (빈 응답 아님)
+        assert len(state.get("response_text", "")) > 0

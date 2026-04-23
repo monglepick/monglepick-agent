@@ -124,17 +124,38 @@ def list_tools_for_role(admin_role: str) -> list[ToolSpec]:
 # __init__.py 하단에서 import 하는 패턴으로 애플리케이션 기동 시 자동 등록한다.
 # 순환 import 를 피하기 위해 파일 하단에 위치.
 #
+# ── Phase D (2026-04-23): v3 재설계 — Read/Draft/Navigate 3종 분류.
+#    v2 Write tool 4개(support_write / settings_write / users_write / points_write)
+#    는 레지스트리 등록 제외 (파일 보존 — revert 가 필요하면 아래 4줄 재활성화).
+#    Draft/Navigate 가 해당 역할을 대체한다.
+#
 # Step 2: stats(5) — 서비스 KPI 통계
 # Step 4: users_read(5) / content_read(4) / payment_read(3) / support_read(3) → Tier 1 15개
-# Step 5a: support_write(faq_create) + settings_write(banner_create) → Tier 2 2개
-# Step 6b(2026-04-23): users_write(user_suspend) + points_write(points_manual_adjust)
-#   → Tier 3 2개 추가, confirm_keyword + before/after 스냅샷. 총 **24개** tool 등록
+# Phase A: stats_extended(10) / ai_ops_read(5) / system_read(3) / settings_read(4) /
+#          chat_suggestions_read(1) / dashboard(3) → Read 26개 추가
+# Phase B: drafts(10) → Draft tool 10개
+# Phase C: navigation(12) → Navigate tool 12개
+# Phase D: v2 Write 4개 제거 → 총 56+10+12 = 76개 (가상 finish_task 제외)
 from monglepick.tools.admin_tools import stats as _stats  # noqa: E402, F401
 from monglepick.tools.admin_tools import users_read as _users_read  # noqa: E402, F401
 from monglepick.tools.admin_tools import content_read as _content_read  # noqa: E402, F401
 from monglepick.tools.admin_tools import payment_read as _payment_read  # noqa: E402, F401
 from monglepick.tools.admin_tools import support_read as _support_read  # noqa: E402, F401
-from monglepick.tools.admin_tools import support_write as _support_write  # noqa: E402, F401
-from monglepick.tools.admin_tools import settings_write as _settings_write  # noqa: E402, F401
-from monglepick.tools.admin_tools import users_write as _users_write  # noqa: E402, F401
-from monglepick.tools.admin_tools import points_write as _points_write  # noqa: E402, F401
+# v2 Write tool 4개 — Phase D 에서 제거 (파일은 revert 용으로 보존)
+# from monglepick.tools.admin_tools import support_write as _support_write  # noqa: E402, F401
+# from monglepick.tools.admin_tools import settings_write as _settings_write  # noqa: E402, F401
+# from monglepick.tools.admin_tools import users_write as _users_write  # noqa: E402, F401
+# from monglepick.tools.admin_tools import points_write as _points_write  # noqa: E402, F401
+# Phase A Batch 1 (2026-04-23): Stats 확장 Read tool 10개
+from monglepick.tools.admin_tools import stats_extended as _stats_extended  # noqa: E402, F401
+# Phase A Batch 2 (2026-04-23): AI 운영·시스템·설정·채팅칩 Read-only tool 14개 추가
+from monglepick.tools.admin_tools import ai_ops_read as _ai_ops_read  # noqa: E402, F401
+from monglepick.tools.admin_tools import system_read as _system_read  # noqa: E402, F401
+from monglepick.tools.admin_tools import settings_read as _settings_read  # noqa: E402, F401
+from monglepick.tools.admin_tools import chat_suggestions_read as _chat_suggestions_read  # noqa: E402, F401
+# Phase A Batch 3 (2026-04-23): Dashboard Read tool 3개
+from monglepick.tools.admin_tools import dashboard as _dashboard  # noqa: E402, F401
+# Phase B (2026-04-23): Draft tool 10개 — Backend 호출 없이 form_prefill payload 만 반환
+from monglepick.tools.admin_tools import drafts as _drafts  # noqa: E402, F401
+# Phase C (2026-04-23): Navigate tool 12개 — GET 으로 대상 검색 + 관리 화면 링크 반환
+from monglepick.tools.admin_tools import navigation as _navigation  # noqa: E402, F401

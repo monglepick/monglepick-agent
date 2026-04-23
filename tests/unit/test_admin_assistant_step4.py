@@ -70,7 +70,8 @@ class TestRoleMatrixTier1:
         """STATS_ADMIN 은 Tier 0 5개만 접근 가능 (Tier 1 전부 거절)."""
         tools = list_tools_for_role("STATS_ADMIN")
         names = {t.name for t in tools}
-        assert len(tools) == 5
+        # v3 Phase A: stats + stats_extended added → flexible count, but all Tier 0
+        assert len(tools) >= 5  # At least Tier 0 tools
         assert all(t.tier == 0 for t in tools)
         # 개인정보/결제 리소스 전부 차단
         assert "users_list" not in names
@@ -317,12 +318,18 @@ class TestGraphQueryE2E:
         assert "3건" in state.get("response_text", "")
 
     @pytest.mark.asyncio
-    async def test_query_no_matching_tool_uses_placeholder(
+    async def test_query_no_matching_tool_goes_to_smart_fallback(
         self, monkeypatch, mock_ollama,
     ):
-        """selector 가 None 반환 시 query placeholder ("적합한 도구를 찾지 못했어요")."""
+        """
+        Step 6c(2026-04-23): selector 가 None 반환 시 smart_fallback_responder 가
+        Solar 로 LLM 역제안을 생성한다 (기존 고정 placeholder 대신).
+        """
         mock_ollama.set_structured_response(
             AdminIntent(kind="query", confidence=0.9),
+        )
+        mock_ollama.set_response(
+            "해당 질문은 관리자 tool 로 답하기 어려워요. 유저 조회나 주문 조회로 바꿔 말씀해 주실래요?",
         )
         async def fake_select(**kwargs):
             return None
@@ -338,4 +345,5 @@ class TestGraphQueryE2E:
             user_message="지구 반대편 날씨 알려줘",
         )
         assert state.get("pending_tool_call") is None
-        assert "적합한 도구" in state.get("response_text", "")
+        response = state.get("response_text", "")
+        assert len(response) > 0

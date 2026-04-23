@@ -1,40 +1,42 @@
 """
 관리자 AI 에이전트 LangGraph StateGraph 구성 + SSE 실행 인터페이스.
 
-설계서: docs/관리자_AI에이전트_설계서.md §3.2 (그래프), §8.2 (SSE 10이벤트)
+설계서: docs/관리자_AI에이전트_v3_재설계.md §2 (ReAct 그래프), §3 (SSE 이벤트)
 
-Step 2 범위 (2026-04-23, 확장):
+Phase D v3 범위 (2026-04-23):
     START → context_loader → intent_classifier ──┐
                                                   │
     ┌────────── smalltalk ─────────────────┤
-    ▼                                       │
-    smalltalk_responder                     │ stats
-    │                                       ▼
-    │                                tool_selector ──┐
-    │                                       │        │ pending=None
-    │                              pending  ▼        │
-    │                                tool_executor   │
-    │                                       ▼        │
-    │                                   narrator     │
-    │                                       │        │
-    ▼                                       ▼        ▼
-    response_formatter ◀──── query/action/report/sql
-         ▼
-        END
+    ▼                                       │ stats/query/action
+    smalltalk_responder                     ▼
+    │                                tool_selector ◀─────────────┐
+    │                                       │                     │ continue
+    │                         pending=None  │ pending_tool_call   │
+    │                                ▼      ▼                     │
+    │                  smart_fallback  tool_executor              │
+    │                  _responder           ▼                     │
+    │                       │           observation ──────────────┘
+    │                       │               │
+    │                       │               ├─ *_draft  → draft_emitter
+    │                       │               ├─ goto_*   → navigator
+    │                       │               └─ finish/max_hops → narrator
+    │                       │               │
+    │                       │               ▼
+    │                       └──────→ narrator → response_formatter → END
+    │                                                ▲
+    └────────────────────────────────────────────────┘
 
-후속 Step 에서 추가될 엣지:
-    tool_selector → risk_gate (Tier ≥ 2) → HITL interrupt → tool_executor
-    narrator → data_analyzer (추가 tool 필요 여부) → tool_selector 루프 (최대 5회)
+변경 이력 (v2 → v3):
+- risk_gate 노드 제거 (실제 쓰기 tool 없음, HITL 불필요)
+- observation / draft_emitter / navigator 신규 노드 추가
+- ReAct 루프: tool_executor → observation → (tool_selector | draft_emitter | navigator | narrator)
+- SSE 이벤트 2종 신규: form_prefill, navigation
+- HITL interrupt 감지 블록 보존 (v3 에서 발동 안 함 — risk_gate 제거로 snapshot.next 항상 빔)
 
-SSE 이벤트 (Step 2 에서 발행하는 것):
-- session     : 세션 ID 발급
-- status      : 노드 진행 상태
-- tool_call   : tool_selector 완료 — {tool_name, arguments, tier}
-- tool_result : tool_executor 완료 — {tool_name, ok, latency_ms, row_count}
-- token       : 최종 응답 텍스트 (narrator or response_formatter)
-- done / error
-
-후속 Step 에서 추가: confirmation_required / chart_data / table_data / report_chunk
+SSE 이벤트 (v3 발행 목록):
+- session, status, tool_call (매 hop), tool_result (매 hop), token, done, error
+- form_prefill (draft_emitter 완료 시)
+- navigation (navigator 완료 시)
 """
 
 from __future__ import annotations
@@ -55,14 +57,20 @@ from monglepick.agents.admin_assistant.models import (
     AdminAssistantState,
     AdminIntent,
     ToolCall,
+    ensure_intent,
+    ensure_tool_call,
 )
 from monglepick.agents.admin_assistant.nodes import (
+    MAX_HOPS,
     context_loader,
+    draft_emitter,
     intent_classifier,
     narrator,
+    navigator,
+    observation,
     response_formatter,
-    risk_gate,
     smalltalk_responder,
+    smart_fallback_responder,
     tool_executor,
     tool_selector,
 )
@@ -92,8 +100,9 @@ def route_after_intent(state: AdminAssistantState) -> str:
         logger.info("route_after_intent_blocked", reason="no_admin_role")
         return "response_formatter"
 
-    intent = state.get("intent")
-    kind = intent.kind if isinstance(intent, AdminIntent) else "smalltalk"
+    # MemorySaver 복원 시 dict 로 변환된 경우도 AdminIntent 로 되살린다.
+    intent = ensure_intent(state.get("intent"))
+    kind = intent.kind if intent is not None else "smalltalk"
 
     if kind == "smalltalk":
         return "smalltalk_responder"
@@ -108,36 +117,101 @@ def route_after_intent(state: AdminAssistantState) -> str:
 
 def route_after_tool_select(state: AdminAssistantState) -> str:
     """
-    tool_selector 이후 분기 (Step 5a 수정).
+    tool_selector 이후 분기 (v3 Phase D).
 
-    - pending_tool_call 이 있으면 **risk_gate** 로 (Tier 0/1 은 risk_gate 가 즉시 통과시키고,
-      Tier 2/3 는 interrupt 발동). 이 변경으로 쓰기 작업(Tier 2+)은 반드시 HITL 을 지나게 된다.
-    - 없으면 (적합한 tool 없음 / 권한 없음 / LLM 에러) response_formatter 에서 placeholder.
+    v3 변경점:
+    - risk_gate 제거 — tool_executor 로 직행.
+    - finish_task 가 선택된 경우 tool_executor 를 건너뛰고 narrator 로 직행.
+      (finish_task 는 가상 tool 로 실제 Backend 호출이 없으므로 executor 불필요)
+    - pending_tool_call 이 None 이면 smart_fallback_responder.
+
+    흐름:
+      pending=finish_task → narrator
+      pending=실제 tool → tool_executor → observation → ...
+      pending=None → smart_fallback_responder
     """
-    call = state.get("pending_tool_call")
-    if isinstance(call, ToolCall):
+    call = ensure_tool_call(state.get("pending_tool_call"))
+    if call is None:
+        logger.info("route_after_tool_select_no_tool_to_fallback")
+        return "smart_fallback_responder"
+
+    if call.tool_name == "finish_task":
+        # 가상 tool — executor 건너뛰고 narrator 로 직행
         logger.info(
-            "route_after_tool_select",
-            tool_name=call.tool_name,
-            tier=call.tier,
+            "route_after_tool_select_finish_task",
+            reason=call.arguments.get("reason", ""),
         )
-        return "risk_gate"
-    logger.info("route_after_tool_select_no_tool")
-    return "response_formatter"
+        return "narrator"
+
+    logger.info(
+        "route_after_tool_select",
+        tool_name=call.tool_name,
+        tier=call.tier,
+    )
+    return "tool_executor"
 
 
-def route_after_risk_gate(state: AdminAssistantState) -> str:
+def route_after_observation(state: AdminAssistantState) -> str:
     """
-    risk_gate 이후 분기 (Step 5a).
+    observation 이후 분기 (v3 Phase D 신규).
 
-    - pending_tool_call 이 None 으로 비워졌다면 사용자가 거절했거나 에러 → response_formatter.
-    - 여전히 ToolCall 이면 승인(또는 Tier<2 로 통과) → tool_executor.
+    ReAct 루프의 핵심 분기점. tool_executor 결과를 observation 이 기록한 뒤,
+    다음 hop 을 계속할지 종결 경로로 나갈지 결정한다.
+
+    우선순위:
+    1. iteration_count >= MAX_HOPS → narrator (강제 종결, 토큰 비용/무한 루프 방어)
+    2. tool_call_history 가 비어있음 → narrator (방어 코드, 정상 흐름에서는 발생 안 함)
+    3. 마지막 tool 이 finish_task → narrator (LLM 이 "충분하다" 고 판단)
+    4. 마지막 tool 이 *_draft → draft_emitter (form_prefill SSE 발행 후 narrator)
+    5. 마지막 tool 이 goto_* → navigator (navigation SSE 발행 후 narrator)
+    6. 그 외 read tool → tool_selector (다음 hop 계속)
     """
-    call = state.get("pending_tool_call")
-    if isinstance(call, ToolCall):
-        return "tool_executor"
-    logger.info("route_after_risk_gate_rejected_or_missing")
-    return "response_formatter"
+    hop_count: int = state.get("iteration_count") or 0
+
+    # 1) MAX_HOPS 도달 → 강제 종결
+    if hop_count >= MAX_HOPS:
+        logger.info(
+            "route_after_observation_max_hops",
+            hop_count=hop_count,
+            max_hops=MAX_HOPS,
+        )
+        return "narrator"
+
+    # tool_call_history 에서 마지막 항목 꺼내기
+    history = state.get("tool_call_history") or []
+    if not history:
+        logger.debug("route_after_observation_empty_history")
+        return "narrator"
+
+    last_raw = history[-1]
+    # MemorySaver 직렬화로 dict 화된 경우도 처리
+    last_call = ensure_tool_call(last_raw)
+    last_name: str = last_call.tool_name if last_call else (
+        last_raw.get("tool_name", "") if isinstance(last_raw, dict) else ""
+    )
+
+    # 2) finish_task → narrator
+    if last_name == "finish_task":
+        logger.info("route_after_observation_finish_task")
+        return "narrator"
+
+    # 3) *_draft → draft_emitter
+    if last_name.endswith("_draft"):
+        logger.info("route_after_observation_draft", tool_name=last_name)
+        return "draft_emitter"
+
+    # 4) goto_* → navigator
+    if last_name.startswith("goto_"):
+        logger.info("route_after_observation_navigate", tool_name=last_name)
+        return "navigator"
+
+    # 5) 그 외 read tool → tool_selector (다음 hop)
+    logger.info(
+        "route_after_observation_continue",
+        tool_name=last_name,
+        hop_count=hop_count,
+    )
+    return "tool_selector"
 
 
 # ============================================================
@@ -146,27 +220,42 @@ def route_after_risk_gate(state: AdminAssistantState) -> str:
 
 def build_admin_assistant_graph():
     """
-    Admin Assistant StateGraph 구성 + 컴파일.
+    Admin Assistant StateGraph 구성 + 컴파일 (v3 Phase D).
 
-    Step 5a (2026-04-23): 8노드 + 3개 조건부 분기 + MemorySaver checkpointer.
-        risk_gate 가 Tier≥2 에서 LangGraph `interrupt()` 를 호출하려면 checkpointer 가 필요하다.
-        MemorySaver 는 프로세스 메모리 기반이므로 재기동 시 흐름이 사라진다 — 운영 레벨은
-        RedisSaver/PostgresSaver 로 교체 권장(후속 Step). 다만 Step 5a 는 ephemeral 세션
-        모델이라 `run_admin_assistant` → `/resume` 라이프사이클이 같은 프로세스 내에서 완결된다.
+    v3 변경점:
+    - risk_gate 노드 제거. tool_selector → tool_executor 직행.
+    - observation / draft_emitter / navigator 신규 노드 추가.
+    - ReAct 루프: tool_executor → observation → route_after_observation →
+        (tool_selector | draft_emitter | navigator | narrator)
+    - draft_emitter / navigator → narrator → response_formatter → END
+    - MemorySaver checkpointer 유지 (v3 에서 interrupt 발동 안 하지만 세션 유지 용도 보존).
+
+    노드 수: 11개 (context_loader, intent_classifier, smalltalk_responder, tool_selector,
+             tool_executor, observation, draft_emitter, navigator, narrator,
+             smart_fallback_responder, response_formatter)
     """
     graph = StateGraph(AdminAssistantState)
 
+    # ── 기존 노드 ──
     graph.add_node("context_loader", context_loader)
     graph.add_node("intent_classifier", intent_classifier)
     graph.add_node("smalltalk_responder", smalltalk_responder)
     graph.add_node("tool_selector", tool_selector)
-    graph.add_node("risk_gate", risk_gate)  # Step 5a 신규
     graph.add_node("tool_executor", tool_executor)
     graph.add_node("narrator", narrator)
+    graph.add_node("smart_fallback_responder", smart_fallback_responder)
     graph.add_node("response_formatter", response_formatter)
 
+    # ── v3 Phase D 신규 노드 ──
+    graph.add_node("observation", observation)        # tool_executor 결과 누적
+    graph.add_node("draft_emitter", draft_emitter)   # *_draft tool 결과 → form_prefill
+    graph.add_node("navigator", navigator)            # goto_* tool 결과 → navigation
+
+    # ── 고정 엣지 ──
     graph.add_edge(START, "context_loader")
     graph.add_edge("context_loader", "intent_classifier")
+
+    # intent_classifier → (smalltalk_responder | tool_selector | response_formatter)
     graph.add_conditional_edges(
         "intent_classifier",
         route_after_intent,
@@ -178,33 +267,52 @@ def build_admin_assistant_graph():
     )
     graph.add_edge("smalltalk_responder", "response_formatter")
 
-    # tool_selector → risk_gate 또는 response_formatter
+    # tool_selector → (tool_executor | narrator | smart_fallback_responder)
+    # finish_task 선택 시 narrator 직행, 일반 tool 은 tool_executor, 매칭 실패는 fallback
     graph.add_conditional_edges(
         "tool_selector",
         route_after_tool_select,
         {
-            "risk_gate": "risk_gate",
-            "response_formatter": "response_formatter",
-        },
-    )
-    # risk_gate → tool_executor (승인/통과) 또는 response_formatter (거절)
-    graph.add_conditional_edges(
-        "risk_gate",
-        route_after_risk_gate,
-        {
             "tool_executor": "tool_executor",
-            "response_formatter": "response_formatter",
+            "narrator": "narrator",
+            "smart_fallback_responder": "smart_fallback_responder",
         },
     )
-    graph.add_edge("tool_executor", "narrator")
-    graph.add_edge("narrator", "response_formatter")
+    graph.add_edge("smart_fallback_responder", "response_formatter")
 
+    # tool_executor → observation (항상)
+    graph.add_edge("tool_executor", "observation")
+
+    # observation → (tool_selector | draft_emitter | navigator | narrator)
+    graph.add_conditional_edges(
+        "observation",
+        route_after_observation,
+        {
+            "tool_selector": "tool_selector",
+            "draft_emitter": "draft_emitter",
+            "navigator": "navigator",
+            "narrator": "narrator",
+        },
+    )
+
+    # draft_emitter / navigator → narrator (form_prefill/navigation 세팅 후 자연어 안내)
+    graph.add_edge("draft_emitter", "narrator")
+    graph.add_edge("navigator", "narrator")
+
+    # narrator → response_formatter → END
+    graph.add_edge("narrator", "response_formatter")
     graph.add_edge("response_formatter", END)
 
-    # MemorySaver checkpointer — interrupt/resume 을 위해 필수
+    # MemorySaver checkpointer — v3 에서 interrupt 발동 안 하지만 세션 컨텍스트 보존용 유지.
+    # 운영 레벨에서는 RedisSaver 로 교체 권장 (Phase E Step 7).
     checkpointer = MemorySaver()
     compiled = graph.compile(checkpointer=checkpointer)
-    logger.info("admin_assistant_graph_compiled", node_count=8, checkpointer="memory")
+    logger.info(
+        "admin_assistant_graph_compiled",
+        node_count=11,
+        checkpointer="memory",
+        version="v3_phase_d",
+    )
     return compiled
 
 
@@ -220,11 +328,17 @@ _NODE_STATUS_MESSAGES: dict[str, str] = {
     "context_loader": "관리자 정보를 확인하고 있어요...",
     "intent_classifier": "요청 의도를 분석하고 있어요...",
     "smalltalk_responder": "답변을 준비하고 있어요...",
-    "tool_selector": "적합한 도구를 고르고 있어요... 🧰",
-    "risk_gate": "실행 전 안전 점검 중이에요... 🛡️",
-    "tool_executor": "관리자 API를 호출하고 있어요... 🔌",
+    "tool_selector": "적합한 도구를 고르고 있어요...",
+    "tool_executor": "관리자 API를 호출하고 있어요...",
+    # v3 Phase D 신규 노드
+    "observation": "결과를 검토하고 있어요...",
+    "draft_emitter": "폼 내용을 정리하고 있어요...",
+    "navigator": "관리 화면 링크를 준비하고 있어요...",
     "narrator": "결과를 정리해 설명하고 있어요...",
+    "smart_fallback_responder": "답변 방향을 고민하고 있어요...",
     "response_formatter": "응답을 정리하고 있어요...",
+    # v3 에서 제거된 노드 — 하위 호환 메시지 보존 (SSE status 가 이 키를 참조하는 경우 대비)
+    "risk_gate": "실행 전 안전 점검 중이에요...",  # v3 미사용
 }
 
 
@@ -253,9 +367,9 @@ def state_snapshot_tool_call(merged_state: dict) -> ToolCall | None:
 
     SSE 발행 시점에는 `updates` 에만 최신 값이 있고 `final_state` 는 누적본이라,
     tool_executor 완료 이벤트 쪽에서 tool 이름을 참조하려면 이 헬퍼로 꺼낸다.
+    MemorySaver 직렬화로 dict 화된 경우도 ensure_tool_call 로 복원한다.
     """
-    call = merged_state.get("pending_tool_call")
-    return call if isinstance(call, ToolCall) else None
+    return ensure_tool_call(merged_state.get("pending_tool_call"))
 
 
 # ============================================================
@@ -371,8 +485,18 @@ async def run_admin_assistant(
             if isinstance(item, Exception):
                 raise item
 
-            # {"node_name": {updates}}
+            # {"node_name": {updates}} — 단, LangGraph 1.0 은 내부 특수 노드
+            # (`__start__`, `__interrupt__`, `__end__`) 이벤트에서 value 로 None 또는
+            # non-dict(tuple of Interrupt) 을 실어 보내기도 한다. 이런 이벤트는 final_state
+            # 에 merge 할 대상이 아니라 스킵 + SSE 이벤트도 발행하지 않는다.
             for node_name, updates in item.items():
+                if updates is None or not isinstance(updates, dict):
+                    logger.debug(
+                        "admin_assistant_stream_skip_special_event",
+                        node_name=node_name,
+                        updates_type=type(updates).__name__,
+                    )
+                    continue
                 final_state.update(updates)
 
                 # 노드 완료 status
@@ -392,10 +516,10 @@ async def run_admin_assistant(
                     current_message = next_msg
 
                 # tool_selector 완료 시 tool_call SSE 이벤트 (투명성 — 사용자에게 "무엇을
-                # 하려는지" 노출). pending_tool_call 이 None 이면 발행 스킵.
+                # 하려는지" 노출). pending_tool_call 이 None 이거나 finish_task 이면 발행 스킵.
                 if node_name == "tool_selector":
-                    call = updates.get("pending_tool_call")
-                    if isinstance(call, ToolCall):
+                    call = ensure_tool_call(updates.get("pending_tool_call"))
+                    if call is not None and call.tool_name != "finish_task":
                         yield _format_sse_event(
                             "tool_call",
                             {
@@ -426,6 +550,22 @@ async def run_admin_assistant(
                             },
                         )
 
+                # v3 Phase D: draft_emitter 완료 시 form_prefill SSE 이벤트 발행.
+                # Client 가 이 이벤트를 받으면 FormPrefillCard 를 렌더하고
+                # "[action_label]" 버튼으로 navigate(target_path, {state: {draft: ...}}) 제공.
+                if node_name == "draft_emitter":
+                    prefill = updates.get("form_prefill")
+                    if prefill and isinstance(prefill, dict):
+                        yield _format_sse_event("form_prefill", prefill)
+
+                # v3 Phase D: navigator 완료 시 navigation SSE 이벤트 발행.
+                # Client 가 이 이벤트를 받으면 NavigationCard 를 렌더하고
+                # 단건이면 "이동" 버튼, 다건이면 candidates 리스트 + 각각의 "이동" 버튼 제공.
+                if node_name == "navigator":
+                    nav = updates.get("navigation")
+                    if nav and isinstance(nav, dict):
+                        yield _format_sse_event("navigation", nav)
+
                 # response_formatter 완료 시 최종 응답 텍스트를 token 으로 발행
                 if node_name == "response_formatter":
                     response_text = updates.get("response_text", "")
@@ -435,16 +575,13 @@ async def run_admin_assistant(
                         )
 
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
-        intent_kind = (
-            final_state.get("intent").kind
-            if isinstance(final_state.get("intent"), AdminIntent)
-            else "unknown"
-        )
+        _final_intent = ensure_intent(final_state.get("intent"))
+        intent_kind = _final_intent.kind if _final_intent is not None else "unknown"
 
         # ── HITL interrupt 감지 ──
-        # Step 5a: 그래프가 END 로 가지 않고 risk_gate 에서 interrupt 로 멈춘 경우,
-        # checkpointer snapshot 의 next 가 비어있지 않다. 이 때는 confirmation_required
-        # 이벤트를 발행한 뒤 done 없이 스트림을 종료해 Client 가 /resume 을 호출하도록 한다.
+        # v3 에서 발동 안 함 — risk_gate 노드 제거로 interrupt() 호출 지점이 사라졌다.
+        # snapshot.next 는 항상 빈 tuple 이므로 is_interrupted=False 로 처리된다.
+        # 블록 자체는 하위 호환 및 향후 Phase E+ HITL 재도입 대비로 보존.
         snapshot = await admin_assistant_graph.aget_state(graph_config)
         is_interrupted = bool(snapshot.next)
 
@@ -519,10 +656,16 @@ async def run_admin_assistant(
 
 def _predict_next_node(completed_node: str, merged_state: dict) -> tuple[str, str]:
     """
-    방금 완료된 노드 이후 실행될 다음 노드의 (phase, message) 예측.
+    방금 완료된 노드 이후 실행될 다음 노드의 (phase, message) 예측 (v3 Phase D).
 
-    keepalive 메시지를 정확히 갱신하기 위함. Chat Agent graph.py 의
-    _predict_next_node 와 동일 컨셉이지만 Admin 그래프는 훨씬 단순해 inline 처리.
+    keepalive status 메시지를 정확히 갱신하기 위함. 라우팅 함수를 직접 호출해 예측.
+    예외 발생 시 ("", "") 반환 — keepalive 메시지가 갱신 안 될 뿐 흐름에 영향 없음.
+
+    v3 변경점:
+    - risk_gate 예측 제거
+    - tool_executor → observation 예측 추가
+    - observation → route_after_observation 호출로 예측
+    - draft_emitter / navigator → narrator 예측 추가
 
     Returns:
         (phase, message) — 예측 불가면 ("", "")
@@ -540,13 +683,20 @@ def _predict_next_node(completed_node: str, merged_state: dict) -> tuple[str, st
             next_node = route_after_tool_select(merged_state)
             msg = _NODE_STATUS_MESSAGES.get(next_node, "")
             return (next_node, msg)
-        if completed_node == "risk_gate":
-            next_node = route_after_risk_gate(merged_state)
+        if completed_node == "tool_executor":
+            # v3: tool_executor 는 항상 observation 으로 이동
+            return ("observation", _NODE_STATUS_MESSAGES["observation"])
+        if completed_node == "observation":
+            next_node = route_after_observation(merged_state)
             msg = _NODE_STATUS_MESSAGES.get(next_node, "")
             return (next_node, msg)
-        if completed_node == "tool_executor":
+        if completed_node == "draft_emitter":
+            return ("narrator", _NODE_STATUS_MESSAGES["narrator"])
+        if completed_node == "navigator":
             return ("narrator", _NODE_STATUS_MESSAGES["narrator"])
         if completed_node == "narrator":
+            return ("response_formatter", _NODE_STATUS_MESSAGES["response_formatter"])
+        if completed_node == "smart_fallback_responder":
             return ("response_formatter", _NODE_STATUS_MESSAGES["response_formatter"])
     except Exception:
         pass

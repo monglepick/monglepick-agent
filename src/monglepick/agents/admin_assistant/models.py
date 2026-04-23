@@ -265,6 +265,45 @@ class MessageTurn(TypedDict, total=False):
     content: str
 
 
+# ============================================================
+# State 값 복원 헬퍼 (Step 6b 후속 — MemorySaver 직렬화 대응)
+# ============================================================
+# LangGraph MemorySaver 가 state 를 체크포인트에 저장/복원하는 과정에서 Pydantic BaseModel
+# 이 dict 로 변환되는 경우가 있다(`PydanticSerializationUnexpectedValue` 경고로 확인됨).
+# 소비 지점마다 `isinstance(x, AdminIntent)` / `isinstance(x, ToolCall)` 만으로 체크하면
+# dict 복원 케이스에서 값을 무시해 흐름이 깨진다(예: route 함수가 '도구 없음' 으로 오판단 →
+# `'NoneType' object is not iterable` 같은 간접 에러). 두 헬퍼는 Pydantic 객체든 dict 든
+# 동일한 도메인 객체로 복원해 주며, 복원 실패 시 None 을 돌려 graceful 처리를 가능케 한다.
+
+
+def ensure_intent(value: Any) -> "AdminIntent | None":
+    """state 의 `intent` 필드를 AdminIntent 로 정규화."""
+    if value is None:
+        return None
+    if isinstance(value, AdminIntent):
+        return value
+    if isinstance(value, dict):
+        try:
+            return AdminIntent.model_validate(value)
+        except Exception:  # noqa: BLE001 — 복원 실패 시 graceful None
+            return None
+    return None
+
+
+def ensure_tool_call(value: Any) -> "ToolCall | None":
+    """state 의 `pending_tool_call` 필드를 ToolCall 로 정규화."""
+    if value is None:
+        return None
+    if isinstance(value, ToolCall):
+        return value
+    if isinstance(value, dict):
+        try:
+            return ToolCall.model_validate(value)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 class AdminAssistantState(TypedDict, total=False):
     """
     Admin Assistant LangGraph State.
@@ -300,13 +339,9 @@ class AdminAssistantState(TypedDict, total=False):
     latest_tool_ref_id: str
     analysis_outputs: list[dict[str, Any]]     # pandas aggregate 결과 (Step 3 도입)
 
-    # ── HITL 승인 (Step 5a 활성화) ──
-    # awaiting_confirmation: risk_gate 에서 interrupt 발동 직전에 True 로 설정.
-    #   SSE 레이어가 이 플래그를 보고 confirmation_required 이벤트 발행 여부를 결정.
-    # confirmation_payload: ConfirmationPayload.model_dump() — SSE 이벤트에 그대로 실림.
-    # confirmation_decision: /resume 호출 시 넘어온 ConfirmationDecision.model_dump().
-    #   risk_gate 가 재개되면서 decision='reject' 면 response_text 를 직접 채우고
-    #   pending_tool_call=None 으로 비워서 실행 경로를 차단.
+    # ── HITL 승인 (Step 5a 활성화) — v3 에서 미사용, 하위호환 위해 보존 ──
+    # v3 재설계(Phase D)에서 risk_gate 노드가 제거되어 이 필드들은 실제로 세팅되지 않는다.
+    # 기존 테스트/외부 코드가 참조할 수 있으므로 타입 선언은 남기되 내부 로직에서는 무시한다.
     awaiting_confirmation: bool
     confirmation_payload: dict[str, Any] | None
     confirmation_decision: dict[str, Any] | None
@@ -317,5 +352,26 @@ class AdminAssistantState(TypedDict, total=False):
     table_payloads: list[TableSpec]
 
     # ── 제어 ──
-    iteration_count: int               # tool-call 루프 횟수 (최대 5)
+    # iteration_count: hop 횟수. v3 에서 ReAct 루프 hop_count 로 의미 재사용.
+    # observation 노드가 매 hop 마다 1씩 증가시키며, MAX_HOPS 초과 시 narrator 로 강제 종결.
+    iteration_count: int
     error: str | None
+
+    # ── ReAct 루프 상태 (v3 Phase D 신규) ──
+    # tool_call_history: hop 마다 실행된 ToolCall 을 순서대로 누적한다.
+    #   observation 노드가 tool_executor 직후 append 하며, route_after_observation 이
+    #   마지막 항목의 tool_name 을 보고 다음 경로(tool_selector/draft_emitter/navigator/narrator)를 결정.
+    tool_call_history: list[ToolCall]
+    # tool_results_history: 각 hop 결과의 축약본 (tool_name/ok/row_count/summary).
+    #   narrator 가 전체 이력을 컨텍스트로 참조하거나 tool_history_summary 를 구성하는 데 사용한다.
+    tool_results_history: list[dict[str, Any]]
+
+    # ── v3 종결 출력 (draft_emitter / navigator 가 세팅) ──
+    # form_prefill: *_draft tool 이 반환한 폼 초기값 페이로드.
+    #   SSE form_prefill 이벤트로 Client 에 전달 → 관리자가 해당 화면 열기 버튼으로 이동.
+    #   shape: {target_path, draft_fields, action_label, summary, tool_name}
+    form_prefill: dict[str, Any] | None
+    # navigation: goto_* tool 이 반환한 관리 화면 링크 페이로드.
+    #   SSE navigation 이벤트로 Client 에 전달 → 관리자가 이동 버튼으로 직접 처리.
+    #   shape: {target_path|None, label, context_summary, candidates?, tool_name}
+    navigation: dict[str, Any] | None

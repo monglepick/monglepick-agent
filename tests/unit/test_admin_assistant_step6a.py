@@ -167,6 +167,9 @@ class TestLogAgentAction:
 # ============================================================
 
 class TestToolExecutorAudit:
+    pytestmark = pytest.mark.skip(
+        reason="v3 Phase D: Tier 2 audit concept removed with write tools"
+    )
     @pytest.mark.asyncio
     async def test_tier2_execution_triggers_audit(self, monkeypatch):
         """

@@ -182,3 +182,116 @@ register_tool(ToolSpec(
     args_schema=_SubscriptionsListArgs,
     handler=_handle_subscriptions_list,
 ))
+
+
+# ─ v3 확장 ─────────────────────────────────────────────────────────────────
+
+
+# ── Args Schemas (v3 추가) ──────────────────────────────────────────────────
+
+class _PointHistoriesArgs(BaseModel):
+    """GET /api/v1/admin/point/histories 쿼리 파라미터 스키마."""
+
+    userId: str = Field(
+        default="",
+        description="특정 사용자 ID 필터. 빈 문자열이면 전체 사용자 대상.",
+    )
+    fromDate: str = Field(
+        default="",
+        description=(
+            "조회 시작일 (ISO-8601 날짜, 예: 2026-01-01). "
+            "빈 문자열이면 시작일 제한 없음."
+        ),
+    )
+    toDate: str = Field(
+        default="",
+        description=(
+            "조회 종료일 (ISO-8601 날짜, 예: 2026-04-30). "
+            "빈 문자열이면 종료일 제한 없음."
+        ),
+    )
+    page: int = Field(default=0, ge=0, description="페이지 번호 (0부터 시작).")
+    size: int = Field(default=20, ge=1, le=100, description="페이지 크기 (1~100).")
+
+
+class _NoArgs(BaseModel):
+    """인자 없이 호출되는 단순 조회용 빈 스키마."""
+
+    pass
+
+
+# ── Handlers (v3 추가) ────────────────────────────────────────────────────
+
+async def _handle_point_histories(
+    ctx: ToolContext,
+    userId: str = "",
+    fromDate: str = "",
+    toDate: str = "",
+    page: int = 0,
+    size: int = 20,
+) -> AdminApiResult:
+    """GET /api/v1/admin/point/histories — 포인트 변동 전체 이력 조회."""
+    params: dict = {"page": page, "size": size}
+    # 빈 문자열 필터는 Backend 가 전체로 취급하므로 값이 있을 때만 전달
+    if userId:
+        params["userId"] = userId
+    if fromDate:
+        params["fromDate"] = fromDate
+    if toDate:
+        params["toDate"] = toDate
+    raw = await get_admin_json(
+        "/api/v1/admin/point/histories",
+        admin_jwt=ctx.admin_jwt,
+        params=params,
+        invocation_id=ctx.invocation_id,
+    )
+    return unwrap_api_response(raw)
+
+
+async def _handle_point_items(ctx: ToolContext) -> AdminApiResult:
+    """GET /api/v1/admin/point/items — 포인트 상품(이용권) 목록 조회."""
+    raw = await get_admin_json(
+        "/api/v1/admin/point/items",
+        admin_jwt=ctx.admin_jwt,
+        invocation_id=ctx.invocation_id,
+    )
+    return unwrap_api_response(raw)
+
+
+# ── Registration (v3 추가) ─────────────────────────────────────────────────
+
+register_tool(ToolSpec(
+    name="point_histories",
+    tier=1,
+    required_roles=_PAYMENT_READ_ROLES,
+    description=(
+        "포인트 변동 이력을 페이징 조회한다. userId·fromDate·toDate 필터 조합 가능. "
+        "특정 기간 포인트 적립/차감 흐름, 특정 유저 전체 포인트 이력, "
+        "'이번 달 포인트 지급 총액' 같은 질문에 사용한다."
+    ),
+    example_questions=[
+        "2026년 4월 포인트 변동 내역 보여줘",
+        "user_id=abc 전체 포인트 이력",
+        "이번 주 포인트 차감이 많은 이유 확인해줘",
+    ],
+    args_schema=_PointHistoriesArgs,
+    handler=_handle_point_histories,
+))
+
+
+register_tool(ToolSpec(
+    name="point_items",
+    tier=1,
+    required_roles=_PAYMENT_READ_ROLES,
+    description=(
+        "포인트 상품(AI 이용권 패키지) 목록을 조회한다. 인자 불필요. "
+        "현재 판매 중인 이용권 종류·가격·수량 등을 확인할 때 사용한다. "
+        "'이용권 종류 뭐 있어?', '포인트 패키지 가격 알려줘' 에 사용."
+    ),
+    example_questions=[
+        "현재 판매 중인 AI 이용권 종류 알려줘",
+        "포인트 상품 목록 보여줘",
+    ],
+    args_schema=_NoArgs,
+    handler=_handle_point_items,
+))
