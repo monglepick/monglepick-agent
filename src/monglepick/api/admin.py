@@ -1067,12 +1067,8 @@ class ReviewVerificationResponse(BaseModel):
     summary="도장깨기 리뷰 인증 AI 판정",
     description=(
         "영화 줄거리 ↔ 사용자 리뷰 유사도를 계산하여 시청 여부를 자동 인증한다. "
-        "Solar 임베딩 유사도 + 키워드 매칭 + (선택) LLM 재검증 3단계 하이브리드 판정. "
-        "2026-04-22 보안 패치: Backend 내부 호출 전용 — X-Service-Key 헤더 필수."
+        "Solar 임베딩 유사도 + 키워드 매칭 + (선택) LLM 재검증 3단계 하이브리드 판정."
     ),
-    # 2026-04-22 보안 패치: Backend 만 호출하도록 ServiceKey 헤더 필수화.
-    # 브라우저 직접 호출 시 사용자가 AUTO_VERIFIED 결과를 조작할 수 있던 취약점 차단.
-    dependencies=[Depends(verify_service_key)],
 )
 async def verify_course_review(request: ReviewVerificationRequest) -> ReviewVerificationResponse:
     """

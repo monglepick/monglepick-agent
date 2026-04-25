@@ -27,7 +27,7 @@ from langsmith import traceable
 from monglepick.agents.review_verification.models import ReviewVerificationState
 from monglepick.config import settings
 from monglepick.data_pipeline.embedder import embed_query_async
-from monglepick.llm import get_ollama_llm, guarded_ainvoke
+from monglepick.llm import get_conversation_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
 
@@ -287,7 +287,7 @@ async def llm_revalidator(state: ReviewVerificationState) -> dict:
         return {"confidence_draft": confidence_draft, "llm_adjustment": 0.0}
 
     try:
-        llm = get_ollama_llm(model=settings.CONVERSATION_MODEL, temperature=0.1)
+        llm = get_conversation_llm()
         messages = [
             SystemMessage(content=_REVALIDATION_SYSTEM),
             HumanMessage(content=_REVALIDATION_HUMAN.format(
