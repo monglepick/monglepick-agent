@@ -18,11 +18,11 @@ from typing import Any, Optional
 
 import httpx
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, model_validator
 
-from monglepick.api.auth_deps import verify_service_key
+
 from monglepick.config import settings
 from monglepick.db.clients import (
     get_elasticsearch,
