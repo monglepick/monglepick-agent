@@ -312,14 +312,14 @@ async def search_similar_tools(
         logger.warning("admin_tool_search_embedding_failed", error=str(e))
         return []
 
-    # 2) Qdrant 검색
+    # 2) Qdrant 검색 (qdrant-client v1.17+: search → query_points)
     try:
         client = await get_qdrant()
         # role 필터를 Qdrant 측에 위임할 수도 있으나, allowed_tool_names 가 작아서
         # 후처리(파이썬 set 교집합) 가 더 단순하고 빠름.
-        result = await client.search(
+        response = await client.query_points(
             collection_name=ADMIN_TOOL_COLLECTION,
-            query_vector=query_vec.tolist(),
+            query=query_vec.tolist(),
             limit=top_k,
             with_payload=True,
             score_threshold=score_threshold,
@@ -328,9 +328,11 @@ async def search_similar_tools(
         logger.warning("admin_tool_search_qdrant_failed", error=str(e))
         return []
 
+    hits = response.points
+
     # 3) 결과 정렬 + 필터
     ranked: list[tuple[str, float]] = []
-    for hit in result:
+    for hit in hits:
         payload: dict[str, Any] = hit.payload or {}
         name = payload.get("name")
         if not name:
@@ -345,8 +347,8 @@ async def search_similar_tools(
     logger.info(
         "admin_tool_search_done",
         query_preview=query[:60],
-        hits=len(result),
+        hits=len(hits),
         returned=len(names),
-        top_score=result[0].score if result else None,
+        top_score=hits[0].score if hits else None,
     )
     return names
