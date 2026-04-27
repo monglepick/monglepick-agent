@@ -387,3 +387,36 @@ class TestSseStream:
         # needs_human=true 가 실려 나가는지 확인
         needs_human = next(e for e in events if e["event"] == "needs_human")
         assert needs_human["data"]["value"] is True
+
+    async def test_id_only_matched_faq_skipped_in_sse_payload(
+        self, monkeypatch, sample_faqs
+    ):
+        """Backend fetch 미스로 question="" 인 id-only MatchedFaq 가 state 에 남아도,
+        SSE matched_faq 이벤트에는 question 이 비어 있는 항목을 노출하지 않는다.
+
+        Why: 클라이언트(FaqMatchCard)는 question 만 텍스트로 렌더하므로 빈 question
+        은 "📋 " 만 찍힌 빈 카드(=빈 말풍선)로 보인다. 응답 본문 아래에 빈 말풍선이
+        뜬다는 사용자 보고를 회귀 차단하기 위한 가드.
+        """
+        _patch_fetch(monkeypatch, sample_faqs)
+        _patch_reply(
+            monkeypatch,
+            SupportReply(
+                kind="faq",
+                # 999 는 sample_faqs 에 없는 ID — id-only MatchedFaq 가 state 에 남는다
+                matched_faq_ids=[999],
+                answer="자세한 내용은 FAQ 를 확인해 주세요.",
+                needs_human=False,
+            ),
+        )
+
+        events = await self._collect_events(
+            run_support_assistant(
+                user_id="", session_id="", user_message="알 수 없는 ID 케이스"
+            )
+        )
+        # matched_faq 이벤트 자체가 발행되지 않거나(items 가 모두 필터링됨),
+        # 발행되더라도 items 가 빈 배열이어야 한다.
+        matched_events = [e for e in events if e["event"] == "matched_faq"]
+        if matched_events:
+            assert matched_events[0]["data"]["items"] == []

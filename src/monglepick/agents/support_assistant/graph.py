@@ -96,27 +96,41 @@ def _format_sse_event(event_type: str, data: dict) -> dict:
 
 
 def _serialize_matched_faqs(value) -> list[dict]:
-    """matched_faqs 를 SSE JSON 직렬화 가능 형태로 변환."""
+    """matched_faqs 를 SSE JSON 직렬화 가능 형태로 변환.
+
+    UX 가드(2026-04-27): question 이 빈 문자열인 항목은 SSE 페이로드에서 제외한다.
+
+    Why: nodes._select_matched_faqs 는 chain 의 ES candidate 로 검증된 ID 가
+    Backend fetch 결과(state.faqs)에 없을 때 강등을 회피하기 위해 question=""
+    인 id-only MatchedFaq 를 state.matched_faqs 에 보존한다. 이 항목은 클라이언트
+    UI(FaqMatchCard)에서는 "📋 " 만 찍힌 빈 카드(=빈 말풍선)로 렌더되어 사용자에게
+    혼란을 준다. 상태에는 남기되 매칭 카드 UX 입장에선 노출 가치가 0 이므로
+    SSE 단계에서만 떨어낸다.
+    """
     if not value:
         return []
     out: list[dict] = []
     for item in value:
         if isinstance(item, MatchedFaq):
-            out.append(
-                {
-                    "faq_id": item.faq_id,
-                    "category": item.category,
-                    "question": item.question,
-                }
-            )
+            question = item.question
+            faq_id = item.faq_id
+            category = item.category
         elif isinstance(item, dict):
-            out.append(
-                {
-                    "faq_id": item.get("faq_id"),
-                    "category": item.get("category"),
-                    "question": item.get("question"),
-                }
-            )
+            question = item.get("question") or ""
+            faq_id = item.get("faq_id")
+            category = item.get("category")
+        else:
+            continue
+        # 빈 question 항목은 UI 노출에서 제외 (id-only MatchedFaq 보호)
+        if not (question or "").strip():
+            continue
+        out.append(
+            {
+                "faq_id": faq_id,
+                "category": category,
+                "question": question,
+            }
+        )
     return out
 
 
