@@ -31,7 +31,7 @@ import structlog
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
 from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
@@ -464,7 +464,8 @@ class ChatRequest(BaseModel):
 
     user_id: 사용자 ID (빈 문자열이면 익명)
     session_id: 세션 ID (빈 문자열이면 신규 세션)
-    message: 사용자 입력 메시지 (1~2000자, 필수)
+    message: 사용자 입력 메시지 (0~2000자). 이미지가 함께 첨부되면 빈 문자열 허용
+            (image_analyzer 노드가 포스터 분석으로 인식). 메시지·이미지 모두 비어있으면 422.
     image: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
     location: 사용자 위치 (theater/booking 의도에서만 사용, 미제공 시 메시지에서 지명 자동 추출)
     """
@@ -510,10 +511,13 @@ class ChatRequest(BaseModel):
         description="세션 ID (빈 문자열이면 신규 세션)",
     )
     message: str = Field(
-        ...,
-        min_length=1,
+        default="",
         max_length=2000,
-        description="사용자 입력 메시지 (1~2000자)",
+        description=(
+            "사용자 입력 메시지 (0~2000자). 이미지만 업로드할 때는 공란 허용 — "
+            "image_analyzer 노드가 포스터/분위기 분석으로 인식한다. "
+            "메시지·이미지 모두 비어있으면 422."
+        ),
     )
     image: str | None = Field(
         default=None,
@@ -526,6 +530,24 @@ class ChatRequest(BaseModel):
             "미제공 시 메시지에서 지명을 자동 추출해 geocoding 도구로 좌표 변환을 시도한다."
         ),
     )
+
+    @model_validator(mode="after")
+    def _require_message_or_image(self) -> "ChatRequest":
+        """
+        메시지와 이미지 둘 다 비어있는 진짜 빈 요청만 거부.
+
+        Why:
+            기존 `min_length=1` 강제 시 이미지만 업로드하는 케이스(텍스트 공란)가
+            FastAPI ValidationError(422)로 reject 되어 유저가 "이미지만 넣고 전송"
+            할 수 없었다. `/chat/upload` 멀티파트 엔드포인트는 이미 공란을 허용하고
+            있어 두 엔드포인트의 동작이 어긋나있었다.
+        How to apply:
+            - message 가 공백/빈 문자열이고 image 도 None 이면 ValueError → 422
+            - 둘 중 하나라도 있으면 통과 (이미지 단독 / 텍스트 단독 / 둘 다 OK)
+        """
+        if not (self.message and self.message.strip()) and not self.image:
+            raise ValueError("메시지 또는 이미지 중 하나는 반드시 포함되어야 합니다.")
+        return self
 
 
 class ChatSyncResponse(BaseModel):

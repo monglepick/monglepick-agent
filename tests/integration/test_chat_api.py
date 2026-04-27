@@ -142,7 +142,7 @@ class TestChatAPI:
 
     @pytest.mark.asyncio
     async def test_empty_message_validation(self, mock_all_deps):
-        """빈 메시지 → 422 Validation Error."""
+        """빈 메시지 + 이미지 없음 → 422 Validation Error."""
         from monglepick.main import app
 
         transport = ASGITransport(app=app)
@@ -152,6 +152,53 @@ class TestChatAPI:
                 json={"message": ""},
             )
         assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_message_validation(self, mock_all_deps):
+        """공백만 있는 메시지 + 이미지 없음 → 422 (strip 검증)."""
+        from monglepick.main import app
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/chat/sync",
+                json={"message": "   \n\t  "},
+            )
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_image_only_allowed(self, mock_all_deps):
+        """
+        빈 메시지 + 이미지 첨부 → 200 (image_analyzer 노드가 포스터 분석으로 인식).
+
+        이미지만 업로드하는 케이스는 422 가 아니라 정상 처리되어야 한다.
+        실제 image_analyzer/VLM 호출은 이 테스트의 관심사가 아니므로 패치 없이 진행 —
+        chat_sync 엔드포인트가 ChatRequest 검증을 통과하는지만 확인한다.
+        """
+        from monglepick.main import app
+
+        # 1×1 빨강 PNG (매직바이트 89 50 4E 47 통과용 최소 valid PNG)
+        tiny_png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+
+        with patch(
+            "monglepick.agents.chat.nodes.analyze_image",
+            new_callable=AsyncMock,
+        ) as mock_analyze:
+            from monglepick.agents.chat.models import ImageAnalysisResult
+            mock_analyze.return_value = ImageAnalysisResult(analyzed=False)
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/api/v1/chat/sync",
+                    json={"message": "", "image": tiny_png_b64},
+                )
+
+        # 422 가 아니어야 한다 (validator 통과 확인)
+        assert response.status_code == 200, f"이미지만 첨부한 케이스는 200 이어야 한다. body={response.text}"
 
     @pytest.mark.asyncio
     async def test_long_message_validation(self, mock_all_deps):
