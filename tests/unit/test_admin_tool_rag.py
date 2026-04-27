@@ -352,7 +352,7 @@ class TestSearchSimilarTools:
             MagicMock(payload={"name": "user_activity"}, score=0.55),
         ]
         mock_client = MagicMock()
-        mock_client.search = AsyncMock(return_value=hits)
+        mock_client.query_points = AsyncMock(return_value=MagicMock(points=hits))
 
         with (
             patch(
@@ -376,7 +376,7 @@ class TestSearchSimilarTools:
             MagicMock(payload={"name": "user_detail"}, score=0.70),
         ]
         mock_client = MagicMock()
-        mock_client.search = AsyncMock(return_value=hits)
+        mock_client.query_points = AsyncMock(return_value=MagicMock(points=hits))
 
         with (
             patch(
@@ -405,7 +405,7 @@ class TestSearchSimilarTools:
             MagicMock(payload=None, score=0.70),  # null payload
         ]
         mock_client = MagicMock()
-        mock_client.search = AsyncMock(return_value=hits)
+        mock_client.query_points = AsyncMock(return_value=MagicMock(points=hits))
 
         with (
             patch(
