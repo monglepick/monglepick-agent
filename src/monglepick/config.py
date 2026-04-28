@@ -85,11 +85,11 @@ class Settings(BaseSettings):
     # confidence ≥ HIGH → AUTO_VERIFIED (자동 승인)
     # LOW ≤ confidence < HIGH → NEEDS_REVIEW (관리자 검수 대기)
     # confidence < LOW → AUTO_REJECTED (자동 반려)
-    REVIEW_VERIFICATION_THRESHOLD_HIGH: float = 0.7
-    REVIEW_VERIFICATION_THRESHOLD_LOW: float = 0.3
+    REVIEW_VERIFICATION_THRESHOLD_HIGH: float = 0.39
+    REVIEW_VERIFICATION_THRESHOLD_LOW: float = 0.2
     # confidence_draft 가 이 구간에 들어올 때만 LLM 재검증 호출 (구간 밖은 LLM 0회)
-    REVIEW_VERIFICATION_LLM_CALL_LOW: float = 0.5
-    REVIEW_VERIFICATION_LLM_CALL_HIGH: float = 0.8
+    REVIEW_VERIFICATION_LLM_CALL_LOW: float = 0.2
+    REVIEW_VERIFICATION_LLM_CALL_HIGH: float = 0.39
 
     # ── Solar API (Upstage, 추론 품질이 중요한 체인) ──
     # OpenAI 호환 API — langchain-openai의 ChatOpenAI로 연동
