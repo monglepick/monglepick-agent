@@ -35,7 +35,7 @@ logger = structlog.get_logger()
 # 상수
 # ============================================================
 
-_MAX_TEXT_LEN = 1500
+_MAX_TEXT_LEN = 500
 _MIN_REVIEW_LEN = 20
 
 # 임계값은 settings 로 외부화 (2026-04-27 — 운영 튜닝 편의)
@@ -106,7 +106,7 @@ async def preprocessor(state: ReviewVerificationState) -> dict:
     """
     텍스트 정제 + 조기 종료 판단.
 
-    - HTML/마크다운 제거, 1500자 truncate
+    - HTML/마크다운 제거, 500자 truncate
     - 정제 후 리뷰 길이 < 20자이면 early_exit=True로 NEEDS_REVIEW 강등
     """
     try:
@@ -267,9 +267,9 @@ _REVALIDATION_HUMAN = """[영화 줄거리]
 @traceable(name="review_verification.llm_revalidator")
 async def llm_revalidator(state: ReviewVerificationState) -> dict:
     """
-    confidence_draft 0.5~0.8 구간일 때만 EXAONE LLM으로 yes/no 재검증한다.
+    confidence_draft 0.2~0.4 구간일 때만 EXAONE LLM으로 yes/no 재검증한다.
 
-    구간 밖(< 0.5 또는 > 0.8)은 LLM 호출 없이 adjustment=0.0으로 처리한다.
+    구간 밖(< 0.2 또는 > 0.8)은 LLM 호출 없이 adjustment=0.0으로 처리한다.
     LLM 호출 실패 시에도 adjustment=0.0으로 중립 처리하여 에러 전파를 막는다.
     """
     if state.get("early_exit"):
@@ -336,9 +336,9 @@ async def threshold_decider(state: ReviewVerificationState) -> dict:
     최종 confidence 계산 후 임계값 기준으로 review_status를 결정한다.
 
     confidence = clip(confidence_draft + llm_adjustment, 0.0, 1.0)
-    >= 0.7 → AUTO_VERIFIED
-    0.3 ~ 0.7 → NEEDS_REVIEW
-    < 0.3 → AUTO_REJECTED
+    >= 0.4 → AUTO_VERIFIED
+    0.2 ~ 0.4 → NEEDS_REVIEW
+    < 0.2 → AUTO_REJECTED
     """
     if state.get("early_exit"):
         return {}
