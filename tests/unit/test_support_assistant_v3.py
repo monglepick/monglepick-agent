@@ -362,6 +362,41 @@ class TestSseStream:
         # v3: score 필드는 이제 전송되지 않음
         assert "score" not in matched_event["data"]["items"][0]
 
+    async def test_matched_faq_event_filters_id_only_entries(
+        self, monkeypatch, sample_faqs
+    ):
+        """id-only(question="") MatchedFaq 는 SSE 페이로드에서 제외된다.
+
+        Backend FAQ 캐시에 없지만 ES candidate 로 검증된 ID 는 nodes.py 에서
+        kind 강등 방어 목적으로 question="" 인 축약본을 state 에 남긴다.
+        그러나 UI 는 question 텍스트를 본문으로 렌더하므로 그대로 SSE 로
+        흘려 보내면 "📋 " 만 찍힌 빈 박스가 노출된다 (QA 2026-04-28).
+        """
+        _patch_fetch(monkeypatch, sample_faqs)
+        # faq id=999 는 sample_faqs 에 없음 → id-only MatchedFaq 로 보존됨
+        # faq id=1 은 sample_faqs 에 있음 → 정상 question 매핑
+        _patch_reply(
+            monkeypatch,
+            SupportReply(
+                kind="faq",
+                matched_faq_ids=[999, 1],
+                answer="이메일은 contact@monglepick.com 이에요.",
+                needs_human=False,
+            ),
+        )
+
+        events = await self._collect_events(
+            run_support_assistant(
+                user_id="", session_id="", user_message="이메일 알려주세요"
+            )
+        )
+        matched_event = next(e for e in events if e["event"] == "matched_faq")
+        items = matched_event["data"]["items"]
+        # id=999(question="") 는 제외, id=1 만 남는다
+        assert len(items) == 1
+        assert items[0]["faq_id"] == 1
+        assert items[0]["question"]  # 비어 있지 않음
+
     async def test_complaint_kind_skips_matched_faq_event(
         self, monkeypatch, sample_faqs
     ):

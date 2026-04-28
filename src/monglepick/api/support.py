@@ -240,11 +240,15 @@ async def support_chat_sync(
     matched_payload: list[SupportMatchedFaqResponse] = []
     for item in matched:
         if isinstance(item, MatchedFaq):
+            # id-only(question="") 축약본은 UI 표시 불가 → 제외 (graph._serialize_matched_faqs 와 동일 정책)
+            question = (item.question or "").strip()
+            if not question:
+                continue
             matched_payload.append(
                 SupportMatchedFaqResponse(
                     faq_id=item.faq_id,
                     category=item.category,
-                    question=item.question,
+                    question=question,
                 )
             )
 

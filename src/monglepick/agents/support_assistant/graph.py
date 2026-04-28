@@ -96,25 +96,38 @@ def _format_sse_event(event_type: str, data: dict) -> dict:
 
 
 def _serialize_matched_faqs(value) -> list[dict]:
-    """matched_faqs 를 SSE JSON 직렬화 가능 형태로 변환."""
+    """matched_faqs 를 SSE JSON 직렬화 가능 형태로 변환.
+
+    `question` 이 비어 있는 id-only MatchedFaq 는 SSE 페이로드에서 제외한다.
+    `_select_matched_faqs`(nodes.py) 가 ES candidate 로 검증된 ID 를 Backend
+    FAQ 캐시에서 못 찾았을 때 kind 강등 방어 목적으로 question="" 인 축약본을
+    state 에 남기지만, UI 의 FaqMatchCard 는 question 텍스트를 본문으로 렌더하므로
+    그대로 보내면 "📋 " 만 찍힌 빈 박스가 노출된다 (QA 2026-04-28).
+    """
     if not value:
         return []
     out: list[dict] = []
     for item in value:
         if isinstance(item, MatchedFaq):
+            question = (item.question or "").strip()
+            if not question:
+                continue
             out.append(
                 {
                     "faq_id": item.faq_id,
                     "category": item.category,
-                    "question": item.question,
+                    "question": question,
                 }
             )
         elif isinstance(item, dict):
+            question = (item.get("question") or "").strip()
+            if not question:
+                continue
             out.append(
                 {
                     "faq_id": item.get("faq_id"),
                     "category": item.get("category"),
-                    "question": item.get("question"),
+                    "question": question,
                 }
             )
     return out
