@@ -261,9 +261,16 @@ _PLACEHOLDER_MESSAGES: dict[str, str] = {
         "사용자/결제/게시글/리뷰/티켓 등의 조회는 지원되지만, 구체 대상(userId·orderId 등)이 "
         "발화에 포함되어야 하는 경우가 많아요. 질문을 조금 더 구체적으로 말씀해 주세요."
     ),
+    # 2026-04-29: 길 A v3 에서 Draft 11종(Notice/Faq/Help/Banner/Term/PointPack/Reward/Quiz/
+    # Worldcup/ChatSuggestion/TicketReply) + Navigate 14종(공지/FAQ/사용자 정지·역할·포인트·
+    # 이용권 등) 이 구현 완료. tool_selector 가 적합한 도구를 선택하지 못한 fallback 에서
+    # "HITL 단계 미구현" 이라고 안내하던 v2 잔재 문구는 stale → 사용자에게 혼동 야기.
+    # 이제는 "어떻게 더 구체적으로 말해야 도구가 선택되는지" 가이드로 교체.
     "action": (
-        "🛠️ 쓰기 작업(공지·배너·FAQ·퀴즈 CRUD, 계정 정지/환불 등) 은 "
-        "아직 구현되지 않았어요. 관리자 승인 플로우(HITL) 와 함께 다음 단계에서 추가될 예정입니다."
+        "요청하신 작업을 어떤 도구로 처리할지 결정하지 못했어요. 다음과 같이 구체적으로 말씀해 주세요.\n"
+        "- 공지/FAQ/배너/약관/퀴즈/이벤트 등 콘텐츠 작성·수정: 무엇을, 어떤 내용으로 만들지\n"
+        "- 계정 정지·복구·역할 변경: 대상(이메일·닉네임·user_id) 과 사유\n"
+        "- 포인트 조정·AI 이용권 발급: 대상 + 금액·수량 + 사유"
     ),
     # Step 2 에서 stats 는 실제 tool 경로로 분기. 이 placeholder 는
     # "stats intent 이지만 적합한 tool 이 없거나 tool 실행 실패" fallback 으로 쓰인다.
