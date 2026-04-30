@@ -437,23 +437,24 @@ def _select_category(movie: CandidateMovie, index: int) -> str:
     return rotated
 
 
-def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str:
+def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str | None:
     """
     관리자 지정 quiz_type 을 카테고리로 변환한다.
 
-    메타가 비어있으면 'general' 로 강등하여 LLM 환각을 방지한다.
+    필요 메타가 비어있으면 None 을 반환한다.
+    None 을 받은 question_generator 는 해당 영화를 건너뛴다.
     """
     from monglepick.agents.quiz_generation.prompts import CATEGORY_GUIDES
     if quiz_type not in CATEGORY_GUIDES:
-        return "general"
+        return None
     if quiz_type == "plot" and not movie.overview:
-        return "general"
+        return None
     if quiz_type == "cast" and not movie.cast_members:
-        return "general"
+        return None
     if quiz_type == "director" and not movie.director:
-        return "general"
+        return None
     if quiz_type == "year" and not movie.release_year:
-        return "general"
+        return None
     return quiz_type
 
 
@@ -546,13 +547,27 @@ async def question_generator(state: QuizGenerationState) -> dict:
     difficulty = (state.get("difficulty") or "medium").lower()
     quiz_type = (state.get("quiz_type") or "auto").lower()
 
+    import random
+    start_idx = random.randint(0, len(CATEGORY_ROTATION) - 1)
+
     tasks = []
+    skipped_no_data: list[str] = []
     for i, m in enumerate(movies):
         if quiz_type == "auto":
-            category = _select_category(m, i)
+            category = _select_category(m, start_idx + i)
         else:
             category = _select_forced_category(m, quiz_type)
+            if category is None:
+                skipped_no_data.append(m.movie_id)
+                continue
         tasks.append(_generate_one_quiz_llm(m, category, difficulty, quiz_type=quiz_type))
+
+    if skipped_no_data:
+        logger.warning(
+            "quiz_generation_skipped_no_data",
+            quiz_type=quiz_type,
+            movie_ids=skipped_no_data,
+        )
 
     drafts = await asyncio.gather(*tasks, return_exceptions=False)
     drafts_list: list[QuizDraft] = list(drafts)
@@ -714,9 +729,10 @@ async def fallback_filler(state: QuizGenerationState) -> dict:
     forced_movie_id = (state.get("forced_movie_id") or "").strip() or None
     quiz_type = (state.get("quiz_type") or "auto").lower()
 
-    # 영화 선택 모드: 검증 통과한 초안만 반환 (장르 fallback 금지)
+    # 영화 선택 모드: LLM이 실제 생성한 초안만 반환 (장르 fallback 금지)
+    # is_fallback=True 는 LLM 호출 실패 시 생성된 장르 템플릿이므로 제외한다.
     if forced_movie_id and quiz_type != "auto":
-        final = [d for d in drafts if d.valid]
+        final = [d for d in drafts if d.valid and not d.is_fallback]
         logger.info(
             "quiz_generation_fallback_skipped_forced_mode",
             kept=len(final),
@@ -851,11 +867,16 @@ async def persistence(state: QuizGenerationState) -> dict:
 
     count = len(persisted)
     selector_msg = state.get("selector_message") or ""
+    quiz_type = (state.get("quiz_type") or "auto").lower()
+    forced_movie_id = (state.get("forced_movie_id") or "").strip() or None
 
     if count > 0:
         message = f"AI 가 퀴즈 {count}개를 생성하여 PENDING 으로 등록했습니다."
     elif selector_msg:
         message = selector_msg
+    elif forced_movie_id and quiz_type != "auto":
+        type_label = {"plot": "줄거리", "cast": "출연진", "director": "감독", "year": "개봉연도"}.get(quiz_type, quiz_type)
+        message = f"선택한 영화에 '{type_label}' 데이터가 부족하거나 LLM 생성에 실패했습니다. 다른 유형을 선택해 주세요."
     else:
         message = "퀴즈 생성에 실패했습니다. 로그를 확인해 주세요."
 
