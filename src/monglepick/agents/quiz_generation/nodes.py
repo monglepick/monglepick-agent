@@ -486,7 +486,7 @@ async def _generate_one_quiz_llm(
             category=category,
         )
 
-        model_name = getattr(llm, "model", None) or getattr(llm, "model_name", None) or "unknown"
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
         response = await guarded_ainvoke(
             llm,
             [SystemMessage(content=system_text), HumanMessage(content=user_text)],
