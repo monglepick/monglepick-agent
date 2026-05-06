@@ -27,6 +27,7 @@ SupportToolSpec.handler 는 일반 모듈 함수이다.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -130,7 +131,8 @@ class TestLookupMyPointHistory:
     @pytest.mark.asyncio
     async def test_normal_response_normalizes_page_content(self, auth_ctx):
         """Backend Page 응답 → 평면화된 {amount, type, description, createdAt} 배열로 정규화."""
-        backend_now_iso = "2026-04-29T08:00:00"  # cutoff 7일 안쪽
+        backend_now_iso = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        backend_recent_iso = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
         backend_content = [
             {
                 "id": 1001,
@@ -146,7 +148,7 @@ class TestLookupMyPointHistory:
                 "pointAfter": 500,
                 "pointType": "spend",
                 "description": "AI 추천 1회",
-                "createdAt": "2026-04-28T09:00:00",
+                "createdAt": backend_recent_iso,
             },
         ]
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
@@ -165,7 +167,7 @@ class TestLookupMyPointHistory:
                 "amount": -50,
                 "type": "spend",
                 "description": "AI 추천 1회",
-                "createdAt": "2026-04-28T09:00:00",
+                "createdAt": backend_recent_iso,
             },
         ]
         # Backend 시그니처 일치: days 가 아니라 page/size 를 보낸다
@@ -175,15 +177,17 @@ class TestLookupMyPointHistory:
     @pytest.mark.asyncio
     async def test_days_filters_out_older_entries(self, auth_ctx):
         """days=7 이면 cutoff 보다 오래된 항목은 제외된다."""
+        recent_iso = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        old_iso = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
         backend_content = [
             # 충분히 최근 — 포함
             {"id": 2, "pointChange": 10, "pointAfter": 110,
              "pointType": "earn", "description": "출석",
-             "createdAt": "2026-04-28T00:00:00"},
+             "createdAt": recent_iso},
             # cutoff 보다 훨씬 오래됨 (60일 전) — 제외
             {"id": 1, "pointChange": 5, "pointAfter": 100,
              "pointType": "earn", "description": "이벤트",
-             "createdAt": "2026-02-01T00:00:00"},
+             "createdAt": old_iso},
         ]
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
             mock_call.return_value = _ok(self._backend_page(backend_content))
@@ -196,10 +200,11 @@ class TestLookupMyPointHistory:
     @pytest.mark.asyncio
     async def test_flat_list_response_compatibility(self, auth_ctx):
         """향후 Backend 가 평면 list 로 바뀌어도 안전하게 처리한다."""
+        recent_iso = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
         flat_list = [
             {"id": 1, "pointChange": 7, "pointAfter": 7,
              "pointType": "earn", "description": "보너스",
-             "createdAt": "2026-04-29T00:00:00"},
+             "createdAt": recent_iso},
         ]
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
             mock_call.return_value = _ok(flat_list)
@@ -208,7 +213,7 @@ class TestLookupMyPointHistory:
         assert result["ok"] is True
         assert result["data"] == [
             {"amount": 7, "type": "earn", "description": "보너스",
-             "createdAt": "2026-04-29T00:00:00"},
+             "createdAt": recent_iso},
         ]
 
     @pytest.mark.asyncio

@@ -26,6 +26,7 @@ QUIZ_SYSTEM_PROMPT = """당신은 영화 교육 퀴즈 전문가입니다.
   "options": ["선택지1", "선택지2", "선택지3", "선택지4"],
   "correctAnswer": "정답 선택지(options 배열 중 하나와 정확히 일치)",
   "explanation": "정답 해설(1~2문장)",
+  "hint": "정답을 직접 알려주지 않는 단서(1문장, 예: 감독 초기작 특징, 개봉 시기 단서 등)",
   "category": "{category}"
 }}
 
@@ -36,6 +37,7 @@ QUIZ_SYSTEM_PROMPT = """당신은 영화 교육 퀴즈 전문가입니다.
 - correctAnswer 는 options 배열에 존재하는 문자열과 100% 동일해야 함
 - 난이도 '{difficulty}' 수준으로 맞출 것 (easy=상식, medium=영화 팬 수준, hard=마니아)
 - 카테고리 '{category}' 에 해당하는 질문 형식으로 작성
+- hint 는 정답을 직접 포함하지 말고, 방향을 제시하는 단서로 작성
 - 순수 JSON 객체만 출력 (마크다운 코드블록·설명 문구 금지)"""
 
 

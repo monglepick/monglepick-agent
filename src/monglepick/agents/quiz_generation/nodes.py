@@ -184,6 +184,7 @@ def _build_fallback_draft(movie: CandidateMovie, quiz_type: str = "auto") -> Qui
             f"'{movie.title}' 은(는) '{main_genre}' 장르의 작품입니다. "
             f"포스터·로그라인·장르 태그를 통해 확인할 수 있습니다."
         ),
+        hint=f"이 영화의 포스터와 태그라인에서 장르 분위기를 느껴보세요.",
         category="genre",
         quiz_type=quiz_type,
         is_fallback=True,
@@ -510,6 +511,7 @@ async def _generate_one_quiz_llm(
                 options=[str(o).strip() for o in parsed["options"]],
                 correct_answer=str(parsed["correctAnswer"]).strip(),
                 explanation=str(parsed.get("explanation") or "").strip(),
+                hint=str(parsed.get("hint") or "").strip(),
                 category=str(parsed.get("category") or category),
                 quiz_type=quiz_type,
                 is_fallback=False,
@@ -786,6 +788,7 @@ async def _insert_quiz_pending(
     explanation: Optional[str],
     reward_point: int,
     quiz_type: str = "auto",
+    hint: Optional[str] = None,
 ) -> int:
     """
     검증 통과한 퀴즈 초안 1건을 quizzes 테이블에 PENDING 으로 INSERT 한다.
@@ -802,11 +805,11 @@ async def _insert_quiz_pending(
                 INSERT INTO quizzes (
                     movie_id, question, explanation, correct_answer,
                     options, reward_point, status, quiz_date,
-                    quiz_type, created_at, updated_at, created_by, updated_by
+                    quiz_type, hint, created_at, updated_at, created_by, updated_by
                 ) VALUES (
                     %s, %s, %s, %s,
                     %s, %s, 'PENDING', NULL,
-                    %s, NOW(), NOW(), 'ai-agent', 'ai-agent'
+                    %s, %s, NOW(), NOW(), 'ai-agent', 'ai-agent'
                 )
                 """,
                 (
@@ -817,6 +820,7 @@ async def _insert_quiz_pending(
                     options_json,
                     reward_point,
                     quiz_type,
+                    hint or None,
                 ),
             )
             await conn.commit()
@@ -846,6 +850,7 @@ async def persistence(state: QuizGenerationState) -> dict:
                 explanation=d.explanation or None,
                 reward_point=reward_point,
                 quiz_type=d.quiz_type,
+                hint=d.hint or None,
             )
             persisted.append(GeneratedQuizRecord(
                 quiz_id=quiz_id,
