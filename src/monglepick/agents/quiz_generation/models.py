@@ -58,6 +58,7 @@ class QuizDraft(BaseModel):
     options: list[str] = Field(..., description="객관식 4지선다 (정확히 4개)")
     correct_answer: str = Field(..., description="정답 (options 중 하나와 정확히 일치)")
     explanation: str = Field(default="", description="해설 (1~2문장)")
+    hint: str = Field(default="", description="힌트 (정답을 직접 알려주지 않는 1문장 단서)")
     category: str = Field(
         default="general",
         description="질문 카테고리 (genre/director/year/cast/plot/general)",
