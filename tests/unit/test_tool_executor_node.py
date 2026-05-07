@@ -234,3 +234,160 @@ class TestToolExecutorNode:
         assert "response" in result
         # 에러를 전파하지 않고 빈 tool_results 와 안내 응답을 함께 반환
         assert result["tool_results"] == {}
+
+
+# ============================================================
+# 4. 멀티턴 보류 질문 (awaiting_location) 회귀 픽스 — 2026-05-07
+# ============================================================
+
+
+class TestPendingLocationFlow:
+    """
+    회귀 시나리오:
+    Turn 1) 사용자 "근처영화관에서 최신 상영영화 찾아줘" → 지명 추출 실패 → 위치 재질의
+            tool_executor_node 가 pending_question="awaiting_location" 을 set 해야 함
+    Turn 2) 사용자 "강남역" → LLM 이 의도를 잘못(general/info) 분류해도 awaiting_location
+            덕분에 강제 theater 흐름으로 진행 + short_fallback 으로 단일 토큰도 geocoding
+    """
+
+    @pytest.mark.asyncio
+    async def test_location_required_sets_pending_question(self):
+        """위치 재질의 시 pending_question='awaiting_location' 가 state 업데이트로 반환된다."""
+        state = _state_with_intent(
+            "theater",
+            current_input="근처영화관에서 최신 상영영화 찾아줘",
+            location=None,
+        )
+        result = await tool_executor_node(state)
+        assert "어느 지역" in result["response"]
+        assert result.get("pending_question") == "awaiting_location"
+        # 도구 결과는 비어있어야 함 (호출되지 않음)
+        assert "tool_results" not in result
+
+    @pytest.mark.asyncio
+    async def test_pending_location_overrides_misclassified_intent(self):
+        """
+        사용자가 "강남역" 만 보내서 LLM 이 general 로 잘못 분류했어도
+        pending_question 이 set 돼 있으면 theater 로 강제 분기된다.
+        """
+        geo_result = {
+            "latitude": 37.4979,
+            "longitude": 127.0276,
+            "address": "강남역",
+            "place_name": "강남역",
+            "source": "keyword",
+        }
+        # 의도는 일부러 general — pending_question 이 우선이어야 함
+        state = _state_with_intent(
+            "general",
+            current_input="강남역",
+            location=None,
+            pending_question="awaiting_location",
+        )
+        with patch(
+            "monglepick.agents.chat.nodes.geocoding",
+            new=_make_mock_tool(return_value=geo_result),
+        ) as mock_geo, patch(
+            "monglepick.agents.chat.nodes.execute_tool",
+            new=AsyncMock(return_value={"theater_search": [{"name": "CGV 강남", "distance_m": 100}]}),
+        ) as mock_exec:
+            result = await tool_executor_node(state)
+
+        mock_geo.ainvoke.assert_awaited_once_with({"query": "강남역"})
+        mock_exec.assert_awaited_once()
+        kwargs = mock_exec.await_args.kwargs
+        # 강제로 theater 로 실행됐는지 확인
+        assert kwargs["intent"] == "theater"
+        assert "tool_results" in result
+        # 위치 해소 성공 시 보류 플래그는 명시적으로 비워져 다음 턴엔 다시 LLM 분류로 정상 복귀
+        assert result.get("pending_question") is None
+
+    @pytest.mark.asyncio
+    async def test_short_fallback_for_single_token_location(self):
+        """
+        pending_question 컨텍스트에서 사용자가 정규식 패턴 어디에도 안 걸리는 단일 지명
+        ("강남", "홍대", "이태원") 으로만 답해도 입력 자체를 카카오 키워드 검색에 던져
+        위치 해소를 이어간다.
+        """
+        from monglepick.agents.chat.nodes import _extract_location_hint
+
+        # 정규식 매칭 실패하지만 short_fallback 켜면 그대로 반환
+        assert _extract_location_hint("강남", allow_short_fallback=True) == "강남"
+        assert _extract_location_hint("홍대", allow_short_fallback=True) == "홍대"
+        assert _extract_location_hint("이태원", allow_short_fallback=True) == "이태원"
+
+        # short_fallback 꺼져 있으면 None (기존 동작 유지)
+        assert _extract_location_hint("강남", allow_short_fallback=False) is None
+        assert _extract_location_hint("홍대") is None  # default False
+
+    @pytest.mark.asyncio
+    async def test_short_fallback_rejects_long_or_garbage(self):
+        """short_fallback 은 짧고 깔끔한 응답만 통과 — 긴 자유문/특수문자는 거부."""
+        from monglepick.agents.chat.nodes import _extract_location_hint
+
+        # 길이 초과
+        assert (
+            _extract_location_hint("이건너무긴자유문장이고지명이아니에요", allow_short_fallback=True)
+            is None
+        )
+        # 줄바꿈/특수문자 다수
+        assert _extract_location_hint("@#$%^&*", allow_short_fallback=True) is None
+        # 한국어 자연문(긴) — 정규식 매칭도 실패하고 길이도 초과
+        assert (
+            _extract_location_hint("그냥아무거나추천해줘오늘기분이별로야", allow_short_fallback=True)
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_location_uses_short_fallback_for_single_token(self):
+        """
+        end-to-end: pending_question="awaiting_location" + current_input="강남" (단일 지명, 역/근처/동·구 미포함)
+        → short_fallback 활성 → geocoding({"query":"강남"}) 호출.
+        """
+        geo_result = {
+            "latitude": 37.498,
+            "longitude": 127.027,
+            "address": "서울 강남구",
+            "place_name": "강남",
+            "source": "keyword",
+        }
+        state = _state_with_intent(
+            "theater",
+            current_input="강남",  # 정규식 패턴 미매칭 — short_fallback 만 잡을 수 있음
+            location=None,
+            pending_question="awaiting_location",
+        )
+        with patch(
+            "monglepick.agents.chat.nodes.geocoding",
+            new=_make_mock_tool(return_value=geo_result),
+        ) as mock_geo, patch(
+            "monglepick.agents.chat.nodes.execute_tool",
+            new=AsyncMock(return_value={"theater_search": [{"name": "CGV 강남", "distance_m": 100}]}),
+        ):
+            result = await tool_executor_node(state)
+
+        mock_geo.ainvoke.assert_awaited_once_with({"query": "강남"})
+        assert "tool_results" in result
+        assert result.get("pending_question") is None  # 성공 시 비워짐
+
+    @pytest.mark.asyncio
+    async def test_pending_location_geocoding_failure_keeps_flag(self):
+        """
+        pending_question 컨텍스트에서 단일 토큰을 받았지만 geocoding 도 실패하면
+        pending_question 을 그대로 유지(다시 awaiting_location)하여 사용자가 또 다른 지명을
+        보낼 수 있게 한다.
+        """
+        state = _state_with_intent(
+            "theater",
+            current_input="강남",
+            location=None,
+            pending_question="awaiting_location",
+        )
+        with patch(
+            "monglepick.agents.chat.nodes.geocoding",
+            new=_make_mock_tool(return_value=None),  # geocoding 실패
+        ):
+            result = await tool_executor_node(state)
+
+        assert "어느 지역" in result["response"]
+        assert result.get("pending_question") == "awaiting_location"  # 유지
