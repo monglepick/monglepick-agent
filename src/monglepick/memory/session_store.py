@@ -156,6 +156,7 @@ def _flush_to_backend_in_background(
     messages_json: str,
     turn_count: int,
     session_state_json: str,
+    intent_summary_json: str | None = None,
 ) -> None:
     """
     Backend MySQL 에 세션을 async flush 한다 (fire-and-forget).
@@ -172,7 +173,7 @@ def _flush_to_backend_in_background(
                 turn_count=turn_count,
                 title=None,  # Backend 가 첫 턴에서 자동 생성
                 session_state=session_state_json,
-                intent_summary=None,
+                intent_summary=intent_summary_json,
             )
             if result is None:
                 logger.error(
@@ -292,6 +293,7 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             "watch_history": session_state.get("watch_history", []),
             "dismissed_movie_ids": dismissed_movie_ids,
             "recent_recommended_ids": recent_recommended_ids,
+            "intent_summary": session_state.get("intent_summary", {}),
         }
 
         logger.info(
@@ -421,6 +423,17 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
             str(rid) for rid in recent_recommended_ids if rid
         ]
 
+        # intent_summary: 세션 누적 의도 카운트 {"recommend": 3, "search": 1, ...}
+        intent_summary: dict[str, int] = dict(state.get("intent_summary") or {})
+        intent_obj = state.get("intent")
+        if intent_obj is not None and hasattr(intent_obj, "intent") and intent_obj.intent:
+            intent_key = intent_obj.intent
+            intent_summary[intent_key] = intent_summary.get(intent_key, 0) + 1
+        session_state["intent_summary"] = intent_summary
+        intent_summary_json = (
+            json.dumps(intent_summary, ensure_ascii=False) if intent_summary else None
+        )
+
         # JSON 직렬화
         messages_json = json.dumps(messages, ensure_ascii=False, default=str)
         session_state_json = json.dumps(session_state, ensure_ascii=False, default=str)
@@ -434,7 +447,7 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
             "messages": messages_json,
             "turnCount": turn_count,
             "sessionState": session_state_json,
-            "intentSummary": None,
+            "intentSummary": intent_summary_json,
         }
         redis_ok = await _redis_set_session(user_id, session_id, redis_payload)
 
@@ -445,6 +458,7 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
             messages_json=messages_json,
             turn_count=turn_count,
             session_state_json=session_state_json,
+            intent_summary_json=intent_summary_json,
         )
 
         logger.info(
