@@ -431,7 +431,8 @@ def _select_category(movie: CandidateMovie, index: int) -> str:
         return "general"
     if rotated == "year" and not movie.release_year:
         return "general"
-    if rotated == "cast" and not movie.cast_members:
+    # cast_members 가 2명 미만이면 정답 특정이 너무 쉽거나 LLM 환각 위험이 높으므로 강등
+    if rotated == "cast" and len(movie.cast_members) < 2:
         return "general"
     if rotated == "plot" and not movie.overview:
         return "general"
@@ -450,7 +451,7 @@ def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str | None
         return None
     if quiz_type == "plot" and not movie.overview:
         return None
-    if quiz_type == "cast" and not movie.cast_members:
+    if quiz_type == "cast" and len(movie.cast_members) < 2:
         return None
     if quiz_type == "director" and not movie.director:
         return None
@@ -504,12 +505,27 @@ async def _generate_one_quiz_llm(
             and _is_valid_options(parsed.get("options"))
             and parsed.get("correctAnswer") in parsed["options"]
         ):
+            correct = str(parsed["correctAnswer"]).strip()
+
+            # 출연진 환각 방지: correctAnswer 가 DB cast_members 목록에 없으면 fallback.
+            # LLM 이 알 수 없는 영화에 대해 존재하지 않는 배우를 생성하는 케이스 차단.
+            if category == "cast" and movie.cast_members:
+                normalized_cast = [m.strip() for m in movie.cast_members]
+                if correct not in normalized_cast:
+                    logger.warning(
+                        "quiz_cast_hallucination_detected",
+                        movie_id=movie.movie_id,
+                        generated_answer=correct,
+                        db_cast=movie.cast_members,
+                    )
+                    return _build_fallback_draft(movie, quiz_type=quiz_type)
+
             return QuizDraft(
                 movie_id=movie.movie_id,
                 movie_title=movie.title,
                 question=str(parsed["question"]).strip(),
                 options=[str(o).strip() for o in parsed["options"]],
-                correct_answer=str(parsed["correctAnswer"]).strip(),
+                correct_answer=correct,
                 explanation=str(parsed.get("explanation") or "").strip(),
                 hint=str(parsed.get("hint") or "").strip(),
                 category=str(parsed.get("category") or category),
