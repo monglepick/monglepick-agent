@@ -676,6 +676,8 @@ async def run_chat_agent(
         "recent_recommended_ids": (
             session_data.get("recent_recommended_ids", []) if session_data else []
         ),
+        # 세션 누적 의도 카운트 — session_store 가 각 턴 완료 시 갱신
+        "intent_summary": session_data.get("intent_summary", {}) if session_data else {},
     }
 
     logger.info(
@@ -1165,6 +1167,8 @@ async def run_chat_agent_sync(
         "recent_recommended_ids": (
             session_data.get("recent_recommended_ids", []) if session_data else []
         ),
+        # 세션 누적 의도 카운트 — session_store 가 각 턴 완료 시 갱신
+        "intent_summary": session_data.get("intent_summary", {}) if session_data else {},
     }
 
     logger.info(
