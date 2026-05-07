@@ -117,6 +117,9 @@ def route_after_intent(state: ChatAgentState) -> str:
     """
     intent_emotion_classifier 이후 분기 결정.
 
+    - **pending_question="awaiting_location" 우선 처리** — 직전 턴이 위치 재질의로 끝났으면
+      LLM 의도 분류 결과와 무관하게 곧장 tool_executor_node 로 재진입한다.
+      (사용자가 "강남역" 같은 단일 토큰으로만 답해도 결정적으로 위치 해소 흐름 진행)
     - recommend/search → preference_refiner (추천 흐름, emotion_analyzer 스킵)
     - general → general_responder (일반 대화)
     - info/theater/booking → tool_executor_node (도구 실행)
@@ -128,6 +131,18 @@ def route_after_intent(state: ChatAgentState) -> str:
     Returns:
         다음 노드 이름 문자열
     """
+    # ── 0순위: 보류된 위치 질문이 있으면 LLM 분류와 무관하게 위치 해소로 직행 ──
+    # 2026-05-07 회귀 픽스: tool_executor_node 가 직전 턴에 awaiting_location 을 set 했으면
+    # 이번 턴 사용자 메시지(예: "강남역")는 위치 답변으로 간주한다.
+    pending = state.get("pending_question")
+    if pending == "awaiting_location":
+        logger.info(
+            "route_after_intent_pending_location",
+            pending=pending,
+            route="tool_executor_node",
+        )
+        return "tool_executor_node"
+
     intent = state.get("intent")
 
     if intent is None:
@@ -678,6 +693,10 @@ async def run_chat_agent(
         ),
         # 세션 누적 의도 카운트 — session_store 가 각 턴 완료 시 갱신
         "intent_summary": session_data.get("intent_summary", {}) if session_data else {},
+        # 멀티턴 보류 질문 (theater/booking 위치 재질의 후 다음 턴 강제 분기 — 2026-05-07)
+        "pending_question": (
+            session_data.get("pending_question") if session_data else None
+        ),
     }
 
     logger.info(
@@ -1169,6 +1188,10 @@ async def run_chat_agent_sync(
         ),
         # 세션 누적 의도 카운트 — session_store 가 각 턴 완료 시 갱신
         "intent_summary": session_data.get("intent_summary", {}) if session_data else {},
+        # 멀티턴 보류 질문 (theater/booking 위치 재질의 후 다음 턴 강제 분기 — 2026-05-07)
+        "pending_question": (
+            session_data.get("pending_question") if session_data else None
+        ),
     }
 
     logger.info(
