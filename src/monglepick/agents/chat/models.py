@@ -706,6 +706,8 @@ class ChatAgentState(TypedDict, total=False):
 
     # ── intent_classifier 출력 ──
     intent: IntentResult
+    # 세션 누적 의도 카운트 {"recommend": 3, "search": 1, ...} — session_store 가 갱신
+    intent_summary: dict[str, int]
 
     # ── emotion_analyzer 출력 ──
     emotion: EmotionResult
