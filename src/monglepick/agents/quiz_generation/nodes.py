@@ -37,7 +37,7 @@ from monglepick.agents.quiz_generation.prompts import (
     SPOILER_BLACKLIST,
     build_user_prompt,
 )
-from monglepick.db.clients import get_mysql
+from monglepick.db.clients import ES_INDEX_NAME, get_elasticsearch, get_mysql
 from monglepick.llm import get_conversation_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
@@ -386,7 +386,7 @@ async def metadata_enricher(state: QuizGenerationState) -> dict:
                 "tagline": (tagline or "").strip(),
             }
 
-        # 후보 모델 갱신
+        # 후보 모델 갱신 (MySQL 기본 보강)
         out: list[CandidateMovie] = []
         for c in candidates:
             extra = enriched.get(c.movie_id, {})
@@ -404,7 +404,51 @@ async def metadata_enricher(state: QuizGenerationState) -> dict:
             with_overview=sum(1 for c in out if c.overview),
             with_director=sum(1 for c in out if c.director),
         )
-        return {"enriched_candidates": out}
+
+        # ── ES 추가 보강: cast_with_roles / awards / filming_location ──
+        es_enriched: dict[str, dict] = {}
+        try:
+            es = await get_elasticsearch()
+            resp = await es.mget(index=ES_INDEX_NAME, body={"ids": movie_ids})
+            for doc in (resp.get("docs") or []):
+                if not doc.get("found"):
+                    continue
+                mid = str(doc["_id"])
+                src = doc.get("_source") or {}
+
+                # "배우명(배역)" 쌍 파싱 — cast_characters 우선, kobis_actors 보완
+                cast_chars_text = src.get("cast_characters", "") or ""
+                kobis_actors_text = src.get("kobis_actors", "") or ""
+                pairs = re.findall(r'([^\s(]+)\(([^)]+)\)', cast_chars_text)
+                kobis_pairs = re.findall(r'([^\s(]+)\(([^)]+)\)', kobis_actors_text)
+                seen_names: set[str] = set()
+                combined: list[str] = []
+                for name, role in pairs + kobis_pairs:
+                    role = role.strip()
+                    if name and role and name not in seen_names:
+                        seen_names.add(name)
+                        combined.append(f"{name}({role})")
+
+                es_enriched[mid] = {
+                    "cast_with_roles": combined[:10],
+                    "awards": (src.get("awards") or "").strip(),
+                    "filming_location": (src.get("filming_location") or "").strip(),
+                }
+            logger.info(
+                "quiz_generation_es_enrich_done",
+                enriched=len(es_enriched),
+                with_roles=sum(1 for v in es_enriched.values() if v["cast_with_roles"]),
+            )
+        except Exception as e:
+            logger.warning("quiz_generation_es_enrich_failed", error=str(e))
+
+        # ES 보강 데이터를 후보에 병합
+        final_out: list[CandidateMovie] = []
+        for c in out:
+            es_extra = es_enriched.get(c.movie_id, {})
+            final_out.append(c.model_copy(update=es_extra) if es_extra else c)
+
+        return {"enriched_candidates": final_out}
 
     except Exception as e:
         logger.warning("quiz_generation_enricher_failed", error=str(e))
@@ -436,6 +480,9 @@ def _select_category(movie: CandidateMovie, index: int) -> str:
         return "general"
     if rotated == "plot" and not movie.overview:
         return "general"
+    # character: 배역 정보(cast_with_roles)가 없으면 강등
+    if rotated == "character" and len(movie.cast_with_roles) < 2:
+        return "general"
     return rotated
 
 
@@ -454,6 +501,9 @@ def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str | None
         return None
     if quiz_type == "cast" and len(movie.cast_members) < 2:
         logger.warning("forced_category_no_data", quiz_type="cast", movie_id=movie.movie_id, missing="cast_members", count=len(movie.cast_members))
+        return None
+    if quiz_type == "character" and len(movie.cast_with_roles) < 2:
+        logger.warning("forced_category_no_data", quiz_type="character", movie_id=movie.movie_id, missing="cast_with_roles", count=len(movie.cast_with_roles))
         return None
     if quiz_type == "director" and not movie.director:
         logger.warning("forced_category_no_data", quiz_type="director", movie_id=movie.movie_id, missing="director")
@@ -491,6 +541,9 @@ async def _generate_one_quiz_llm(
             tagline=movie.tagline,
             keywords=movie.keywords,
             category=category,
+            cast_with_roles=movie.cast_with_roles or None,
+            awards=movie.awards,
+            filming_location=movie.filming_location,
         )
 
         model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
@@ -521,6 +574,18 @@ async def _generate_one_quiz_llm(
                         movie_id=movie.movie_id,
                         generated_answer=correct,
                         db_cast=movie.cast_members,
+                    )
+                    return _build_fallback_draft(movie, quiz_type=quiz_type)
+
+            # 배역 카테고리 환각 방지: correctAnswer 가 cast_with_roles 의 배우 이름에 없으면 fallback.
+            if category == "character" and movie.cast_with_roles:
+                known_actors = {r.split("(")[0].strip() for r in movie.cast_with_roles}
+                if correct not in known_actors:
+                    logger.warning(
+                        "quiz_character_hallucination_detected",
+                        movie_id=movie.movie_id,
+                        generated_answer=correct,
+                        known_actors=list(known_actors),
                     )
                     return _build_fallback_draft(movie, quiz_type=quiz_type)
 
