@@ -765,6 +765,18 @@ class ChatAgentState(TypedDict, total=False):
     # response_formatter에서 final_answer가 있으면 LLM 생성 없이 그대로 반환한다.
     final_answer: str | None
 
+    # ── 멀티턴 보류 질문 (2026-05-07 회귀 픽스) ──
+    # tool_executor_node 가 theater/booking 의도에서 위치 해소 실패로 사용자에게
+    # "어느 지역 근처에서 찾으실까요?" 를 돌려줄 때 set("awaiting_location") 한다.
+    # 다음 턴 그래프 라우터(route_after_intent) 가 이 플래그를 보면 LLM 의도 분류 결과를
+    # theater 로 강제 오버라이드하고 곧장 tool_executor_node 로 재진입한다.
+    # 이렇게 해야 사용자가 "강남역" 같은 단일 토큰으로만 답해도 LLM 의 분류 신뢰도에
+    # 의존하지 않고 결정적으로 위치 해소 흐름을 이어갈 수 있다.
+    # 값:
+    #   - None: 보류 없음
+    #   - "awaiting_location": tool_executor_node 가 위치 재질의 한 직후 — 다음 턴 강제 theater
+    pending_question: str | None
+
     # ── 세션 내 최근 추천된 영화 ID (중복 추천 방지, 롤링 윈도우) ──
     # "한 편 더 추천해줘" 처럼 같은 세션에서 같은 preferences 로 재검색이 일어나면
     # hybrid_search 가 같은 후보를 결정적으로 반환해 이전 턴과 동일한 카드가 다시 나가고,

@@ -2653,7 +2653,7 @@ _LOCATION_HINT_PATTERNS: list[re.Pattern] = [
 ]
 
 
-def _extract_location_hint(text: str) -> str | None:
+def _extract_location_hint(text: str, *, allow_short_fallback: bool = False) -> str | None:
     """
     사용자 자연어에서 위치 후보 토큰을 추출한다 (geocoding 도구 입력용).
 
@@ -2662,18 +2662,37 @@ def _extract_location_hint(text: str) -> str | None:
 
     Args:
         text: 사용자 입력 (예: "강남역 근처 영화관 알려줘")
+        allow_short_fallback: 정규식이 모두 실패해도 입력이 짧으면(<=15자, 공백 단순)
+            카카오 키워드 검색에 그대로 던질 가치가 있다고 판단해 입력을 그대로 반환한다.
+            tool_executor_node 가 pending_question="awaiting_location" 이면 켠다 —
+            사용자가 "강남", "홍대", "잠실" 처럼 정규식 패턴(역/근처/동·구) 어디에도
+            걸리지 않는 단일 지명으로만 답할 때 위치 해소를 이어가기 위함.
 
     Returns:
         매칭된 첫 토큰 (예: "강남역") 또는 None
     """
     if not text:
         return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+
     for pattern in _LOCATION_HINT_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(stripped)
         if match:
             hint = match.group(1).strip()
             if hint:
                 return hint
+
+    # ── 단일 토큰 fallback (awaiting_location 컨텍스트 전용) ──
+    # 사용자가 위치 재질의에 "강남", "홍대", "이태원", "Itaewon" 처럼 정규식이 안 잡는
+    # 짧은 지명으로만 답하는 케이스. 길이 제한 + 한 단어 위주 휴리스틱으로 거짓양성 최소화.
+    # (긴 자유 문장은 _LOCATION_HINT_PATTERNS 가 이미 잡았어야 하므로 fallback 적용 X)
+    if allow_short_fallback and len(stripped) <= 15:
+        # 알파벳/한글/숫자 + 공백/기본 구두점만 들어있고 줄바꿈 없는 짧은 응답만 통과시킨다.
+        if re.fullmatch(r"[가-힣A-Za-z0-9 ,.\-]+", stripped):
+            return stripped
+
     return None
 
 
@@ -2805,6 +2824,21 @@ async def tool_executor_node(state: ChatAgentState) -> dict:
         intent_str = intent_obj.intent if intent_obj else "unknown"
         current_input = state.get("current_input", "")
 
+        # 직전 턴이 위치 재질의로 끝났으면(pending_question="awaiting_location") LLM 의 의도
+        # 분류 결과와 무관하게 theater 흐름을 강제한다. 사용자 응답이 "강남역", "홍대", "잠실"
+        # 같은 단일 토큰일 때 LLM 이 general/search 로 잘못 분류해도 위치 해소가 이어지도록.
+        # 2026-05-07 회귀 픽스.
+        if state.get("pending_question") == "awaiting_location" and intent_str not in (
+            "theater",
+            "booking",
+        ):
+            logger.info(
+                "tool_executor_node_pending_location_override",
+                original_intent=intent_str,
+                forced_intent="theater",
+            )
+            intent_str = "theater"
+
         # info/theater/booking 외 의도는 본 노드에서 처리하지 않는다 (라우팅 안전망)
         if intent_str not in ("info", "theater", "booking"):
             logger.info("tool_executor_node_unsupported_intent", intent=intent_str)
@@ -2823,8 +2857,15 @@ async def tool_executor_node(state: ChatAgentState) -> dict:
                 }
                 external_map_location_source_total.labels(source="client_supplied").inc()
             else:
-                # 메시지에서 지명 후보 추출 → geocoding 으로 좌표 변환
-                hint = _extract_location_hint(current_input)
+                # 메시지에서 지명 후보 추출 → geocoding 으로 좌표 변환.
+                # 직전 턴이 위치 재질의로 끝났으면(awaiting_location) 사용자가 "강남", "홍대"
+                # 같이 정규식 패턴(역/근처/동·구) 어디에도 안 걸리는 단일 지명으로 답할 때를
+                # 대비해 short_fallback 을 켠다 (입력 자체를 카카오 키워드 검색에 던짐).
+                awaiting_location = state.get("pending_question") == "awaiting_location"
+                hint = _extract_location_hint(
+                    current_input,
+                    allow_short_fallback=awaiting_location,
+                )
                 if hint:
                     geo = await geocoding.ainvoke({"query": hint})
                     if geo and geo.get("latitude") and geo.get("longitude"):
@@ -2855,7 +2896,13 @@ async def tool_executor_node(state: ChatAgentState) -> dict:
                     user_id=user_id,
                 )
                 external_map_location_source_total.labels(source="missing").inc()
-                return {"response": msg}
+                # pending_question="awaiting_location" 플래그를 state 에 남겨 다음 턴
+                # 사용자가 "강남역" 같은 단일 토큰으로만 답해도 LLM 의 의도 분류 신뢰도와
+                # 무관하게 곧장 theater 흐름으로 재진입하도록 한다 (route_after_intent 가 처리).
+                return {
+                    "response": msg,
+                    "pending_question": "awaiting_location",
+                }
 
         # ── info 의도: state 에서 movie_id / movie_title 회수 ──
         movie_id = _resolve_movie_id_from_state(state) if intent_str == "info" else None
@@ -2888,7 +2935,13 @@ async def tool_executor_node(state: ChatAgentState) -> dict:
             user_id=user_id,
         )
 
-        update: dict = {"tool_results": tool_results, "response": response}
+        # 위치 해소가 성공한 시점에서 보류 플래그를 명시적으로 비운다.
+        # (이전 턴에 awaiting_location 으로 진입했고 이번 턴에 좌표가 풀렸을 때 해당)
+        update: dict = {
+            "tool_results": tool_results,
+            "response": response,
+            "pending_question": None,
+        }
         if location is not None:
             update["location"] = location
         return update

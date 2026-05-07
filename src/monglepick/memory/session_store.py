@@ -284,6 +284,14 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             str(mid) for mid in dismissed_movie_ids_raw if mid
         ]
 
+        # 보류 질문 (theater/booking 위치 재질의 후 다음 턴 LLM 우회용, 2026-05-07).
+        # 직렬화 형태는 단순 문자열 또는 None — 다음 턴 route_after_intent / tool_executor_node
+        # 가 같은 키로 읽어 들어 LLM 분류 결과를 강제 오버라이드한다.
+        pending_question_raw = session_state.get("pending_question")
+        pending_question: str | None = (
+            pending_question_raw if isinstance(pending_question_raw, str) and pending_question_raw else None
+        )
+
         data: dict[str, Any] = {
             "messages": messages,
             "preferences": preferences,
@@ -294,6 +302,7 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             "dismissed_movie_ids": dismissed_movie_ids,
             "recent_recommended_ids": recent_recommended_ids,
             "intent_summary": session_state.get("intent_summary", {}),
+            "pending_question": pending_question,
         }
 
         logger.info(
@@ -432,6 +441,16 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
         session_state["intent_summary"] = intent_summary
         intent_summary_json = (
             json.dumps(intent_summary, ensure_ascii=False) if intent_summary else None
+        )
+
+        # pending_question: theater/booking 위치 재질의 후 다음 턴 LLM 우회 플래그
+        # (2026-05-07 회귀 픽스). 값:
+        #   - "awaiting_location": 직전 턴이 위치 재질의로 끝났음 — 다음 턴 강제 theater
+        #   - None: 보류 없음
+        # tool_executor_node 가 위치 해소 성공 시 None 으로 명시적으로 비우고, 실패 시 set 한다.
+        pending_question = state.get("pending_question")
+        session_state["pending_question"] = (
+            pending_question if isinstance(pending_question, str) and pending_question else None
         )
 
         # JSON 직렬화

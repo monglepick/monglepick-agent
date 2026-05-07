@@ -165,15 +165,19 @@ async def execute_tool(
             has_now_showing = isinstance(kobis_result, list) and len(kobis_result) > 0
             pending["kobis_now_showing"] = kobis_result
 
+            # 2026-05-07 회귀 픽스: 박스오피스가 비었어도 영화관 검색은 진행한다.
+            # 종전엔 KOBIS 가 일시적으로 비거나 자정 직후 캐시 공백일 때 theater_search 까지
+            # 통째로 스킵돼 사용자가 "근처 영화관 알려줘" 에 대해 빈 응답만 받는 회귀가 있었다.
+            # 박스오피스 정보는 부가 표시일 뿐이고 위치 기반 영화관 검색은 독립적으로 가치가 있으므로
+            # has_now_showing=False 라도 theater_search/search_movies 를 정상 실행한다.
+            # 영화관 카드만 노출되고 박스오피스 헤드라인이 안 뜨는 정도는 _format_tool_response 에서
+            # 자연스럽게 처리됨.
             if not has_now_showing:
-                # 현재 상영중 영화가 없음 → 영화관/예매 관련 도구를 일괄 스킵.
                 logger.info(
-                    "tool_executor_chain_gated_skip",
+                    "tool_executor_chain_kobis_empty_continue",
                     intent=intent,
-                    reason="kobis_now_showing_empty",
-                    skipped_tools=[n for n in tool_names if n != "kobis_now_showing"],
+                    note="박스오피스 비어있어도 theater_search 는 진행",
                 )
-                return pending
 
             # 정상: 나머지 도구만 이후 루프에서 처리하도록 kobis 제외
             tool_names = [n for n in tool_names if n != "kobis_now_showing"]
