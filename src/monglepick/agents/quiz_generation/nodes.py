@@ -450,12 +450,16 @@ def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str | None
     if quiz_type not in CATEGORY_GUIDES:
         return None
     if quiz_type == "plot" and not movie.overview:
+        logger.warning("forced_category_no_data", quiz_type="plot", movie_id=movie.movie_id, missing="overview")
         return None
     if quiz_type == "cast" and len(movie.cast_members) < 2:
+        logger.warning("forced_category_no_data", quiz_type="cast", movie_id=movie.movie_id, missing="cast_members", count=len(movie.cast_members))
         return None
     if quiz_type == "director" and not movie.director:
+        logger.warning("forced_category_no_data", quiz_type="director", movie_id=movie.movie_id, missing="director")
         return None
     if quiz_type == "year" and not movie.release_year:
+        logger.warning("forced_category_no_data", quiz_type="year", movie_id=movie.movie_id, missing="release_year")
         return None
     return quiz_type
 
@@ -528,7 +532,7 @@ async def _generate_one_quiz_llm(
                 correct_answer=correct,
                 explanation=str(parsed.get("explanation") or "").strip(),
                 hint=str(parsed.get("hint") or "").strip(),
-                category=str(parsed.get("category") or category),
+                category=category,  # LLM 응답의 category 필드 무시 — 요청한 카테고리 고정
                 quiz_type=quiz_type,
                 is_fallback=False,
                 valid=True,
