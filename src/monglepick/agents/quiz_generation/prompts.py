@@ -72,14 +72,25 @@ CATEGORY_GUIDES: dict[str, str] = {
     # 출연진: 주연/조연 이름 식별
     "cast": (
         "이 영화의 '주연 배우'를 묻는 퀴즈를 만드세요. "
-        "correctAnswer 는 반드시 위 [영화 정보]의 '출연' 목록에 있는 이름 중 하나를 그대로 사용해야 합니다 — 목록에 없는 이름을 정답으로 쓰지 마세요. "
+        "correctAnswer 는 반드시 위 [영화 정보]의 '출연 (배역)' 목록에 있는 배우 이름 중 하나를 그대로 사용해야 합니다 — 목록에 없는 이름을 정답으로 쓰지 마세요. "
         "오답은 같은 시대·장르의 다른 배우 이름을 선택하되, 실제로는 이 영화에 출연하지 않은 인물을 사용하세요. "
         "hint 는 해당 배우의 다른 출연작이나 외모·연기 스타일을 암시하는 단서로 작성하세요."
+    ),
+    # 배역: 배역명 → 배우 매핑 (cast_with_roles 가 있을 때만 활성화)
+    "character": (
+        "이 영화에서 특정 '배역(캐릭터)'을 맡은 배우가 누구인지 묻는 퀴즈를 만드세요. "
+        "위 [영화 정보]의 '출연 (배역)' 목록에서 배역명이 명시된 항목(예: 송강호(기택)) 중 하나를 골라 "
+        "'이 영화에서 [배역명] 역을 맡은 배우는?' 형태로 질문을 작성하세요. "
+        "correctAnswer 는 그 배역을 실제로 맡은 배우 이름이어야 합니다. "
+        "오답은 같은 영화에 출연하지 않은 비슷한 계열의 배우 이름을 사용하세요. "
+        "hint 는 해당 배우의 다른 대표작이나 연기 스타일을 암시하는 단서로 작성하세요."
     ),
     # 줄거리/배경: overview 가 있을 때만 활성화
     "plot": (
         "주어진 줄거리(overview)를 꼼꼼히 읽고 이 영화만의 독특한 배경·설정·사건을 묻는 퀴즈를 만드세요. "
         "도입부·중반부의 구체적 장소·시대·직업·사건을 다루되, 결말·반전·등장인물의 운명은 절대 포함하지 마세요. "
+        "overview 에서 직접 확인할 수 있는 구체적 사실(인물 이름, 직업, 장소, 사건)을 활용해 "
+        "줄거리를 모르면 맞추기 어려운 질문을 만드세요. "
         "오답은 비슷한 장르 다른 영화의 설정에서 그럴듯하게 가져오세요. "
         "hint 는 반드시 줄거리·배경·설정에 관한 단서(예: 이야기의 시대적 배경, 주인공의 처지 등)로 작성하고, "
         "감독·개봉연도·배우 정보를 힌트로 쓰지 마세요."
@@ -100,7 +111,7 @@ CATEGORY_GUIDES: dict[str, str] = {
 # question_generator 가 영화 인덱스 % len(CATEGORY_ROTATION) 으로
 # 카테고리를 선택한다. 메타가 비어있는 카테고리는 메타 체크 단계에서
 # "general" 로 다운그레이드된다.
-CATEGORY_ROTATION: list[str] = ["genre", "director", "year", "cast", "plot"]
+CATEGORY_ROTATION: list[str] = ["genre", "director", "year", "cast", "plot", "character"]
 
 
 # ============================================================
@@ -138,18 +149,33 @@ def build_user_prompt(
     tagline: str,
     keywords: list[str],
     category: str,
+    cast_with_roles: list[str] | None = None,
+    awards: str = "",
+    filming_location: str = "",
 ) -> str:
     """
     영화 메타데이터 + 카테고리 가이드를 결합해 LLM 사용자 프롬프트를 조립한다.
 
-    빈 필드는 "정보 없음" 으로 채워 LLM 이 환각하지 않도록 한다.
-    overview 는 600자로 truncate 하여 토큰 사용량을 제한한다.
+    cast_with_roles(ES 보강)가 있으면 배역명 포함 정보를 우선 사용한다.
+    overview 는 1200자로 truncate 하여 plot 카테고리 퀴즈 품질을 높인다.
     """
     guide = CATEGORY_GUIDES.get(category, CATEGORY_GUIDES["general"])
     genres_str = ", ".join(genres) if genres else "정보 없음"
-    cast_str = ", ".join(cast_members[:5]) if cast_members else "정보 없음"
-    keywords_str = ", ".join(keywords[:10]) if keywords else "정보 없음"
-    overview_short = (overview or "정보 없음")[:600]
+
+    # 배역 정보가 있으면 우선 사용 (배역명 포함), 없으면 이름만
+    if cast_with_roles:
+        cast_str = ", ".join(cast_with_roles[:10])
+    else:
+        cast_str = ", ".join(cast_members[:8]) if cast_members else "정보 없음"
+
+    keywords_str = ", ".join(keywords[:15]) if keywords else "정보 없음"
+    overview_short = (overview or "정보 없음")[:1200]
+
+    extras = ""
+    if awards:
+        extras += f"- 수상 이력: {awards}\n"
+    if filming_location:
+        extras += f"- 촬영지: {filming_location}\n"
 
     return (
         f"[카테고리 지시]\n{guide}\n\n"
@@ -158,9 +184,10 @@ def build_user_prompt(
         f"- 장르: {genres_str}\n"
         f"- 개봉연도: {release_year or '미상'}\n"
         f"- 감독: {director or '정보 없음'}\n"
-        f"- 출연: {cast_str}\n"
+        f"- 출연 (배역): {cast_str}\n"
         f"- 키워드: {keywords_str}\n"
         f"- 태그라인: {tagline or '정보 없음'}\n"
-        f"- 줄거리: {overview_short}\n\n"
-        f"위 규칙을 모두 지키고 JSON 객체로만 응답하세요."
+        f"- 줄거리: {overview_short}\n"
+        f"{extras}"
+        f"\n위 규칙을 모두 지키고 JSON 객체로만 응답하세요."
     )

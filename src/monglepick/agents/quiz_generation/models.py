@@ -37,11 +37,17 @@ class CandidateMovie(BaseModel):
         default_factory=list,
         description="주요 출연진 (상위 5인)",
     )
+    cast_with_roles: list[str] = Field(
+        default_factory=list,
+        description="'배우명(배역)' 형식 출연 정보 (ES cast_characters에서 보강)",
+    )
     keywords: list[str] = Field(
         default_factory=list,
-        description="영화 키워드 태그 (최대 10개)",
+        description="영화 키워드 태그 (최대 15개)",
     )
     tagline: str = Field(default="", description="태그라인(짧은 홍보 문구)")
+    awards: str = Field(default="", description="수상 이력 (KMDb awards)")
+    filming_location: str = Field(default="", description="촬영지")
 
 
 class QuizDraft(BaseModel):
