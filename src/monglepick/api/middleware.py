@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
 from monglepick.config import settings
+from monglepick.llm.solar_usage_tracker import set_current_agent
 
 logger = structlog.get_logger()
 
@@ -374,3 +375,64 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
             )
             # 예외를 직접 처리하지 않고 상위로 전파하여 FastAPI 예외 핸들러에게 위임
             raise
+
+
+# ============================================================
+# 3. SolarUsageAttributionMiddleware — Solar 호출 주체(agent_name) 자동 부착
+# ============================================================
+#
+# Solar API 호출 비용/토큰을 어떤 에이전트가 일으켰는지 추적하기 위해 요청 경로에서
+# agent_name 을 추출해 ContextVar 에 set 한다. SolarUsageCallback 이 콜백 시점에
+# get_current_agent() 로 읽어 Backend 적재 페이로드의 agentName 필드로 사용된다.
+#
+# 매핑 정책:
+#   /api/v1/chat/**            → "chat"
+#   /api/v1/match/**           → "match"
+#   /api/v1/admin/assistant/** → "admin_assistant"
+#   /api/v1/support/**         → "support_assistant"
+#   /api/v1/content/**         → "content_analysis"
+#   /api/v1/roadmap/**         → "roadmap"
+#   /api/v1/admin/data/**      → "admin_data"
+#   /api/v1/admin/**           → "admin"
+#   기타                       → "unknown"
+#
+# ContextVar 는 asyncio Task 경계를 따라 자동 복사되므로 한 요청 내부에서 발생하는
+# 모든 LLM 호출이 같은 agent_name 으로 집계된다. 백그라운드 태스크 등 별도 흐름은
+# 명시적으로 set_current_agent() 호출이 필요하다.
+
+# 매핑 우선순위 — 더 구체적인 path 가 먼저 와야 함 (admin/assistant 가 admin 보다 먼저).
+_AGENT_PATH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("/api/v1/chat", "chat"),
+    ("/api/v1/match", "match"),
+    ("/api/v1/admin/assistant", "admin_assistant"),
+    ("/api/v1/admin/data", "admin_data"),
+    ("/api/v1/admin", "admin"),
+    ("/api/v1/support", "support_assistant"),
+    ("/api/v1/content", "content_analysis"),
+    ("/api/v1/roadmap", "roadmap"),
+)
+
+
+def _resolve_agent_name(path: str) -> str:
+    """요청 path 로부터 호출 주체 agent_name 을 결정한다."""
+    for prefix, name in _AGENT_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return name
+    return "unknown"
+
+
+class SolarUsageAttributionMiddleware(BaseHTTPMiddleware):
+    """
+    요청 경로 → Solar usage agent_name 자동 부착 미들웨어.
+
+    가장 안쪽(나중에 등록)에 두어 실제 엔드포인트 핸들러가 호출되기 직전에
+    contextvar 가 세팅되도록 한다.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        agent_name = _resolve_agent_name(request.url.path)
+        # ContextVar.set 은 token 을 반환하지만, 동일 코루틴/하위 태스크에서만
+        # 사용되므로 token 을 따로 reset 하지 않아도 메모리 누수 우려는 없다.
+        # (요청 처리 종료 시 ContextVar 자체가 GC).
+        set_current_agent(agent_name)
+        return await call_next(request)

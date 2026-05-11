@@ -28,7 +28,11 @@ from monglepick.api.admin_assistant import admin_assistant_router
 from monglepick.api.admin_data import admin_data_router
 from monglepick.api.chat import chat_router
 from monglepick.api.match import match_router
-from monglepick.api.middleware import RateLimitMiddleware, TimeoutMiddleware
+from monglepick.api.middleware import (
+    RateLimitMiddleware,
+    SolarUsageAttributionMiddleware,
+    TimeoutMiddleware,
+)
 from monglepick.api.router import api_router
 from monglepick.config import settings
 from monglepick.db.clients import close_all_clients, init_all_clients
@@ -219,9 +223,12 @@ async def lifespan(app: FastAPI):
     # httpx 클라이언트 정리 (C-2: 리소스 누수 방지)
     from monglepick.api.admin_backend_client import close_admin_client
     from monglepick.api.point_client import close_client
+    from monglepick.llm.solar_usage_tracker import close_solar_usage_client
     await close_client()
     await close_admin_client()
     await close_all_clients()
+    # Solar usage 적재 전용 httpx 클라이언트 정리 (2026-05-11 추가)
+    await close_solar_usage_client()
     shutdown_elapsed_ms = (time.perf_counter() - shutdown_start) * 1000
     logger.info("app_shutdown_complete", elapsed_ms=round(shutdown_elapsed_ms, 1))
 
@@ -316,6 +323,11 @@ app.add_middleware(
 # 인증:   분당 RATE_LIMIT_AUTH_RPM 회 (기본 60) — config.py 참조
 app.add_middleware(TimeoutMiddleware)
 app.add_middleware(RateLimitMiddleware)
+# SolarUsageAttributionMiddleware — 요청 path → agent_name 자동 부착.
+# 가장 먼저 등록(가장 안쪽 실행)해 핸들러 진입 직전에 ContextVar 가 세팅되도록 한다.
+# 위 두 미들웨어가 차단한 요청(rate-limited / 타임아웃)은 LLM 호출 자체가 없으므로
+# attribution 누락 우려가 없다.
+app.add_middleware(SolarUsageAttributionMiddleware)
 
 # API 라우터 등록
 app.include_router(api_router, prefix="/api/v1")

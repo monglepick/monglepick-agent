@@ -501,7 +501,7 @@ _TABLE_DATA_MAX_CELL_LEN = 80
 # chatlog/review-verify/chat-suggestions], PaymentPage TABS=[orders/orders_sub/orders_point/
 # subscription/point/items/point_pack/reward_policy], SupportPage TABS=[notice/faq/help/
 # ticket], ContentEventsPage SUB_TABS=[roadmap_course/quiz/worldcup_candidate/ocr_event],
-# BoardPage TABS=[moderation/reports/toxicity/posts/reviews/categories])
+# BoardPage TABS=[reports/posts/reviews/categories] — 2026-05-11 모더레이션 큐/혐오표현 탭 제거)
 #
 # 변경 요약:
 #   subscriptions_list  : tab=subscriptions   → tab=subscription (no s)
@@ -516,8 +516,9 @@ _TABLE_DATA_MAX_CELL_LEN = 80
 #   audit_logs_list     : /admin/settings?tab=audit → 매핑 제거 (audit 탭 없음. None 으로 fallback)
 _TABLE_NAVIGATE_PATHS: dict[str, str] = {
     # 콘텐츠 모더레이션 (BoardPage)
+    # toxicity_list: 혐오표현 탭이 2026-05-11 제거되어 navigate 경로 매핑도 삭제.
+    # 백엔드 `/admin/toxicity` 조회 자체는 유지되며, "전체 보기" 버튼만 미렌더된다.
     "reports_list": "/admin/board?tab=reports",
-    "toxicity_list": "/admin/board?tab=toxicity",
     "posts_list": "/admin/board?tab=posts",
     "reviews_list": "/admin/board?tab=reviews",
     # 사용자 (UsersPage — base path 진입 시 기본 탭=list)

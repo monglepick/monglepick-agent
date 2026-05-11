@@ -40,6 +40,7 @@ from pydantic import BaseModel
 
 from monglepick.config import settings
 from monglepick.llm.concurrency import acquire_model_slot, release_model_slot
+from monglepick.llm.solar_usage_tracker import SolarUsageCallback
 
 logger = structlog.get_logger()
 
@@ -152,6 +153,11 @@ def get_solar_api_llm(
 
     with _cache_lock:
         if cache_key not in _solar_cache:
+            # 콜백: 호출 1건마다 token usage 를 추출해 Backend 에 fire-and-forget 적재.
+            # ChatOpenAI 인스턴스 단위로 부착하므로 (model, temperature) 캐시 키마다
+            # 1개의 SolarUsageCallback 인스턴스가 재사용된다 — agent_name 은 ContextVar
+            # 로 동적 주입되므로 인스턴스 공유에는 문제 없음.
+            usage_callback = SolarUsageCallback(model_name=model)
             _solar_cache[cache_key] = ChatOpenAI(
                 model=model,
                 temperature=temperature,
@@ -160,12 +166,14 @@ def get_solar_api_llm(
                 max_tokens=2048,
                 timeout=settings.SOLAR_API_TIMEOUT,
                 max_retries=settings.SOLAR_API_MAX_RETRIES,
+                callbacks=[usage_callback],
             )
             logger.info(
                 "solar_api_llm_created",
                 model=model,
                 temperature=temperature,
                 base_url=settings.SOLAR_API_BASE_URL,
+                usage_tracking=True,
             )
         else:
             logger.debug("solar_cache_hit", model=model, temperature=temperature)
